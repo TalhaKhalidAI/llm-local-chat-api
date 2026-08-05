@@ -1,43 +1,36 @@
 # Dockerfile
-FROM ubuntu:22.04
+FROM python:3.10-slim
 
 # ============================================
-# 1. Install System Dependencies + Vulkan
+# 1. System Dependencies + Vulkan + SPIRV
 # ============================================
-RUN apt-get update && apt-get install -y \
-    python3.10 \
-    python3-pip \
-    python3.10-venv \
-    curl \
-    wget \
-    git \
-    build-essential \
-    cmake \
-    pkg-config \
-    libvulkan1 \
-    vulkan-tools \
-    mesa-vulkan-drivers \
-    libsqlite3-dev \
-    dnsutils \
-    iputils-ping \
+RUN apt-get update && apt-get install -y --fix-missing \
+    curl wget git \
+    build-essential cmake ninja-build pkg-config \
+    libvulkan1 libvulkan-dev vulkan-tools mesa-vulkan-drivers \
+    spirv-headers spirv-tools \
+    glslc \
+    libsqlite3-dev dnsutils iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
-# ============================================
-# 2. Set Python 3.10 as default
-# ============================================
-RUN ln -sf /usr/bin/python3.10 /usr/bin/python && \
-    ln -sf /usr/bin/python3.10 /usr/bin/python3
+# Verify glslc exists
+RUN glslc --version
 
 # ============================================
-# 3. Install Python dependencies
+# 2. Install Python dependencies
 # ============================================
 WORKDIR /app
 COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir python-dotenv uvicorn[standard]
+RUN grep -v "llama-cpp-python" requirements.txt > requirements.no-llama.txt && \
+    pip install --no-cache-dir --timeout=100 -r requirements.no-llama.txt
 
 # ============================================
-# 4. Copy the entire application
+# 3. Install llama-cpp-python with Vulkan support
+# ============================================
+RUN CMAKE_ARGS="-DGGML_VULKAN=ON" pip install --no-cache-dir llama-cpp-python
+
+# ============================================
+# 4. Copy the rest of the application
 # ============================================
 COPY . .
 
@@ -56,17 +49,7 @@ ENV HSA_OVERRIDE_GFX_VERSION=10.3.0
 ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
 
 # ============================================
-# 7. Expose ports
+# 7. Expose and run
 # ============================================
 EXPOSE 8000
-
-# ============================================
-# 8. Health check
-# ============================================
-HEALTHCHECK --interval=30s --timeout=10s --start-period=40s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
-
-# ============================================
-# 9. Start the application
-# ============================================
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
