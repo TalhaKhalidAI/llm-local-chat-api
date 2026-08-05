@@ -1,0 +1,88 @@
+
+
+services:
+  llm-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: llm-local-chat-api
+    restart: unless-stopped
+    
+    # ============================================
+    # Network configuration
+    # ============================================
+    networks:
+      a-class-bridge:
+        # Optional static IP
+        # ipv4_address: 10.0.0.50
+    
+    # ============================================
+    # DNS configuration
+    # ============================================
+    dns:
+      - 192.168.100.33
+      - 8.8.8.8
+      - 8.8.8.4
+    
+    # ============================================
+    # GPU access (AMD Vulkan)
+    # ============================================
+    devices:
+      - /dev/dri:/dev/dri
+      - /dev/kfd:/dev/kfd
+    
+    # ============================================
+    # Environment variables from .env file
+    # ============================================
+    env_file:
+      - .env   # Load all variables from .env
+    
+    # Override LLM_MODEL_PATH to use container path
+    environment:
+      - LLM_MODEL_PATH=/mnt/talha_linux/talha/Documents/DEv/Python/LLM BOT/Models
+      - HSA_OVERRIDE_GFX_VERSION=10.3.0
+      - VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
+      - PYTHONUNBUFFERED=1
+    
+    # ============================================
+    # Port mappings
+    # ============================================
+    ports:
+      - "8000:8000"
+    
+    # ============================================
+    # Volumes
+    # ============================================
+    volumes:
+      # Application code (for development)
+      - ./App:/app/App
+      - ./main.py:/app/main.py
+      - ./app.db:/app/app.db
+      
+      # Model directory - mount your host model path to /models in container
+      # Replace with your actual model path
+      - /mnt/talha_linux/talha/Documents/DEv/Python:/models:ro
+      
+      # Logs
+      - ./logs:/logs
+      
+      # .env file (so changes reflect without rebuild)
+      - ./.env:/app/.env:ro
+    
+    # ============================================
+    # Health check
+    # ============================================
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+# ============================================
+# Networks
+# ============================================
+networks:
+  a-class-bridge:
+    external: true
+    name: a-class-bridge

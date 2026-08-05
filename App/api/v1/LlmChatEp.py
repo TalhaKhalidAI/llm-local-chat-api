@@ -6,11 +6,24 @@ from uuid import uuid4
 import time
 import traceback
 import logging
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = logging.getLogger(__name__)
 
 llmRouter = APIRouter(tags=["LLM Chat Model"])
-
+text_splitter = RecursiveCharacterTextSplitter(
+    chunk_size=2000,      # Max chars per chunk
+    chunk_overlap=200,    # Overlap to maintain context
+    separators=[
+        "\n\n",          # Split on paragraphs first
+        "\n",            # Then new lines
+        ". ",            # Then sentences
+        ",",             # Then clauses
+        " ",             # Then words
+        ""               # Finally characters
+    ],
+    length_function=len,
+)
 # ============================================
 # Repository Instance
 # ============================================
@@ -27,6 +40,43 @@ def get_repo() -> llmChatRepo:
     """Dependency to get the repository instance."""
     return _repo
 
+def split_large_messages(messages, splitter, max_chunk_size: int = 4000) -> str:
+    """
+    Build prompt from messages with automatic splitting of large content.
+    """
+    prompt = ""
+    
+    for msg in messages:
+        content = msg.content
+        
+        # Check if content needs splitting
+        if len(content) > max_chunk_size:
+            logger.info(f"📝 Splitting {msg.role} message: {len(content)} chars -> chunks")
+            chunks = splitter.split_text(content)
+            
+            # Add each chunk with part numbering
+            for i, chunk in enumerate(chunks):
+                part_label = f" (Part {i+1}/{len(chunks)})" if len(chunks) > 1 else ""
+                
+                if msg.role == "system":
+                    prompt += f"[SYSTEM]{part_label} {chunk}\n"
+                elif msg.role == "user":
+                    prompt += f"[USER]{part_label} {chunk}\n"
+                elif msg.role == "assistant":
+                    prompt += f"[ASSISTANT]{part_label} {chunk}\n"
+            
+            logger.info(f"✅ Split into {len(chunks)} chunks")
+        else:
+            # Normal content - no splitting needed
+            if msg.role == "system":
+                prompt += f"[SYSTEM] {content}\n"
+            elif msg.role == "user":
+                prompt += f"[USER] {content}\n"
+            elif msg.role == "assistant":
+                prompt += f"[ASSISTANT] {content}\n"
+    
+    prompt += "[ASSISTANT] "
+    return prompt
 
 @llmRouter.post("/chat/completions")
 async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Depends(get_repo)):
@@ -62,27 +112,22 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
                 )
         
         # ============================================
-        # 2. BUILD PROMPT FROM MESSAGES
+        # 2. BUILD PROMPT FROM MESSAGES WITH SPLITTING
         # ============================================
-        prompt = ""
-        for msg in request.messages:
-            if msg.role == "system":
-                prompt += f"[SYSTEM] {msg.content}\n"
-            elif msg.role == "user":
-                prompt += f"[USER] {msg.content}\n"
-            elif msg.role == "assistant":
-                prompt += f"[ASSISTANT] {msg.content}\n"
-        
-        prompt += "[ASSISTANT] "
+        prompt = split_large_messages(request.messages, text_splitter)
         
         if not prompt or prompt == "[ASSISTANT] ":
             prompt = "[USER] Hello\n[ASSISTANT] "
         
+        # Log prompt size
+        prompt_chars = len(prompt)
+        prompt_tokens_estimate = prompt_chars // 4
+        logger.info(f"📝 Prompt: {prompt_chars} chars (~{prompt_tokens_estimate} tokens)")
+        logger.info(f"📄 Preview: {prompt[:150]}...")
+        
         # ============================================
         # 3. CALL THE LLM with safe parameter handling
         # ============================================
-        logger.info(f"Sending prompt to LLM: {prompt[:100]}...")
-        
         # Build kwargs safely
         gen_kwargs = {
             "temperature": request.temperature,
@@ -106,7 +151,10 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
         
         content = response if isinstance(response, str) else str(response)
         
-        logger.info(f"LLM response received: {content[:100]}...")
+        logger.info(f"✅ LLM response received: {content[:100]}...")
+        
+        # Calculate usage
+        completion_tokens = len(content.split())
         
         return ChatResponse(
             id=f"chatcmpl-{uuid4().hex[:8]}",
@@ -124,9 +172,9 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
                 )
             ],
             usage={
-                "prompt_tokens": len(prompt.split()),
-                "completion_tokens": len(content.split()),
-                "total_tokens": len(prompt.split()) + len(content.split())
+                "prompt_tokens": prompt_tokens_estimate,
+                "completion_tokens": completion_tokens,
+                "total_tokens": prompt_tokens_estimate + completion_tokens
             }
         )
         
@@ -137,6 +185,117 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error occurred during chat with LLM: {str(e)}"
         )
+
+
+# @llmRouter.post("/chat/completions")
+# async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Depends(get_repo)):
+#     try:
+#         logger.info(f"Chat request - Model: {request.model}, Messages: {len(request.messages)}")
+        
+#         # ============================================
+#         # 1. CHECK IF REPOSITORY IS READY
+#         # ============================================
+#         if not await repo.is_ready():
+#             logger.warning("Repository not ready - attempting to initialize...")
+#             try:
+#                 await repo.initialize(model_name=request.model)
+#                 logger.info(f"Repository initialized with model: {request.model}")
+#             except Exception as e:
+#                 logger.error(f"Failed to initialize repository: {e}")
+#                 return ChatResponse(
+#                     id=f"chatcmpl-{uuid4().hex[:8]}",
+#                     object="chat.completion",
+#                     created=int(time.time()),
+#                     model=request.model,
+#                     choices=[
+#                         ChatChoice(
+#                             index=0,
+#                             message=ChatMessage(
+#                                 role="assistant",
+#                                 content=f"Error: Model '{request.model}' not loaded. Error: {str(e)}"
+#                             ),
+#                             finish_reason="error"
+#                         )
+#                     ],
+#                     usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+#                 )
+        
+#         # ============================================
+#         # 2. BUILD PROMPT FROM MESSAGES
+#         # ============================================
+#         prompt = ""
+#         for msg in request.messages:
+#             if msg.role == "system":
+#                 prompt += f"[SYSTEM] {msg.content}\n"
+#             elif msg.role == "user":
+#                 prompt += f"[USER] {msg.content}\n"
+#             elif msg.role == "assistant":
+#                 prompt += f"[ASSISTANT] {msg.content}\n"
+        
+#         prompt += "[ASSISTANT] "
+        
+#         if not prompt or prompt == "[ASSISTANT] ":
+#             prompt = "[USER] Hello\n[ASSISTANT] "
+        
+#         # ============================================
+#         # 3. CALL THE LLM with safe parameter handling
+#         # ============================================
+#         logger.info(f"Sending prompt to LLM: {prompt[:100]}...")
+        
+#         # Build kwargs safely
+#         gen_kwargs = {
+#             "temperature": request.temperature,
+#             "max_tokens": request.max_tokens,
+#         }
+        
+#         # Only add optional params if they exist
+#         if hasattr(request, 'top_p') and request.top_p is not None:
+#             gen_kwargs["top_p"] = request.top_p
+        
+#         if hasattr(request, 'top_k') and request.top_k is not None:
+#             gen_kwargs["top_k"] = request.top_k
+        
+#         if hasattr(request, 'stop') and request.stop is not None:
+#             gen_kwargs["stop"] = request.stop
+        
+#         response = await repo.chat(
+#             prompt=prompt,
+#             **gen_kwargs
+#         )
+        
+#         content = response if isinstance(response, str) else str(response)
+        
+#         logger.info(f"LLM response received: {content[:100]}...")
+        
+#         return ChatResponse(
+#             id=f"chatcmpl-{uuid4().hex[:8]}",
+#             object="chat.completion",
+#             created=int(time.time()),
+#             model=request.model,
+#             choices=[
+#                 ChatChoice(
+#                     index=0,
+#                     message=ChatMessage(
+#                         role="assistant",
+#                         content=content
+#                     ),
+#                     finish_reason="stop"
+#                 )
+#             ],
+#             usage={
+#                 "prompt_tokens": len(prompt.split()),
+#                 "completion_tokens": len(content.split()),
+#                 "total_tokens": len(prompt.split()) + len(content.split())
+#             }
+#         )
+        
+#     except Exception as e:
+#         logger.error(f"Error in chat completion: {e}")
+#         logger.error(traceback.format_exc())
+#         raise HTTPException(
+#             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+#             detail=f"Error occurred during chat with LLM: {str(e)}"
+#         )
 
 # ============================================
 # LOAD MODEL ENDPOINT
