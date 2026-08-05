@@ -26,7 +26,7 @@ services:
       - .env
     
     environment:
-      - LLM_MODEL_PATH="/mnt/llm_models/"
+      - LLM_MODEL_PATH=/models
       - HSA_OVERRIDE_GFX_VERSION=10.3.0
       - VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/radeon_icd.x86_64.json
       - PYTHONUNBUFFERED=1
@@ -40,7 +40,7 @@ services:
       - ./App:/app/App
       - ./main.py:/app/main.py
       - ./app.db:/app/app.db
-      - /mnt/talha_linux/talha/Documents/DEv/Python:/models:ro
+      - /mnt/llm_models/:/models:ro
       - ./logs:/logs
       - ./.env:/app/.env:ro
     
