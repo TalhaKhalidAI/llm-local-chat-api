@@ -29,11 +29,13 @@ text_splitter = RecursiveCharacterTextSplitter(
 # ============================================
 _repo = llmChatRepo(
     model_path=settings.LLM_MODEL_PATH,
-    temperature=0.7,
-    n_gpu_layers=-1,
-    n_ctx=16384,
-    n_predict=2048,
-    n_threads=6
+    n_gpu_layers=settings.LLM_N_GPU_LAYERS,
+    n_ctx=settings.LLM_N_CTX,
+    n_batch=settings.LLM_N_BATCH,
+    n_threads=settings.LLM_N_THREADS,
+    verbose=settings.LLM_VERBOSE,
+    use_mmap=settings.USE_MMAP,
+    use_mlock=settings.USE_MLOCK,
 )
 
 def get_repo() -> llmChatRepo:
@@ -128,21 +130,20 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
         # ============================================
         # 3. CALL THE LLM with safe parameter handling
         # ============================================
-        # Build kwargs safely
-        gen_kwargs = {
-            "temperature": request.temperature,
-            "max_tokens": request.max_tokens,
-        }
-        
-        # Only add optional params if they exist
-        if hasattr(request, 'top_p') and request.top_p is not None:
+        # Build kwargs safely from request parameters
+        gen_kwargs = {}
+        if getattr(request, 'temperature', None) is not None:
+            gen_kwargs["temperature"] = request.temperature
+        if getattr(request, 'max_tokens', None) is not None:
+            gen_kwargs["max_tokens"] = request.max_tokens
+        if getattr(request, 'top_p', None) is not None:
             gen_kwargs["top_p"] = request.top_p
-        
-        if hasattr(request, 'top_k') and request.top_k is not None:
+        if getattr(request, 'top_k', None) is not None:
             gen_kwargs["top_k"] = request.top_k
-        
-        if hasattr(request, 'stop') and request.stop is not None:
+        if getattr(request, 'stop', None) is not None:
             gen_kwargs["stop"] = request.stop
+        if getattr(request, 'repeat_penalty', None) is not None:
+            gen_kwargs["repeat_penalty"] = request.repeat_penalty
         
         response = await repo.chat(
             prompt=prompt,

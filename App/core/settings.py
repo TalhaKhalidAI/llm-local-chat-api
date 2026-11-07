@@ -18,6 +18,68 @@ class Settings(BaseSettings):
         default="/home/talha/Documents/DEv/Python/LLM BOT/Models",
         description="Path to the LLM model file or model name"
     )
+    
+    USE_MMAP: bool = Field(
+        default=True,
+        description="Enable mmap for model loading in llama.cpp"
+    )
+    
+    USE_MLOCK: bool = Field(
+        default=False,
+        description="Enable mlock to lock model in memory in llama.cpp"
+    )
+
+    # LLM Infrastructure / Model Loading (Hardware allocation)
+    LLM_N_CTX: int = Field(
+        default=16384,
+        description="Context window size in tokens"
+    )
+    
+    LLM_N_GPU_LAYERS: int = Field(
+        default=-1,
+        description="GPU offload layers (-1=auto, 0=CPU only)"
+    )
+    
+    LLM_N_BATCH: int = Field(
+        default=512,
+        description="Batch size for prompt processing"
+    )
+    
+    LLM_N_THREADS: int = Field(
+        default=6,
+        description="Number of CPU threads for inference"
+    )
+    
+    LLM_VERBOSE: bool = Field(
+        default=False,
+        description="Enable llama.cpp verbose logging"
+    )
+    
+    # LLM Default Generation / Sampling Fallbacks (Inference runtime)
+    DEFAULT_TEMPERATURE: float = Field(
+        default=0.7,
+        description="Default sampling temperature"
+    )
+    
+    DEFAULT_TOP_P: float = Field(
+        default=0.9,
+        description="Default top-p nucleus sampling"
+    )
+    
+    DEFAULT_TOP_K: int = Field(
+        default=40,
+        description="Default top-k sampling"
+    )
+    
+    DEFAULT_MAX_TOKENS: int = Field(
+        default=2048,
+        description="Default maximum tokens to generate"
+    )
+    
+    DEFAULT_REPEAT_PENALTY: float = Field(
+        default=1.1,
+        description="Default repeat penalty"
+    )
     # Security (REQUIRED)
     SECRET_KEY: SecretStr = Field(
         description="Secret key for JWT token signing"
@@ -174,7 +236,34 @@ class Settings(BaseSettings):
             return v.lower() in ('true', '1', 'yes', 'on')
         return False
     
+    @field_validator('USE_MMAP', mode='before')
+    @classmethod
+    def validate_use_mmap(cls, v: Any) -> bool:
+        if v is None:
+            return True
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ('true', '1', 'yes', 'on')
+        return bool(v)
+
+    @field_validator('USE_MLOCK', 'LLM_VERBOSE', mode='before')
+    @classmethod
+    def validate_use_mlock(cls, v: Any) -> bool:
+        if v is None:
+            return False
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            return v.lower() in ('true', '1', 'yes', 'on')
+        return bool(v)
+    
     # Computed properties
+    @property
+    def MODEL_PATH(self) -> str:
+        """Alias for LLM_MODEL_PATH"""
+        return self.LLM_MODEL_PATH
+
     @property
     def secret_key_str(self) -> str:
         """Get the secret key as string"""

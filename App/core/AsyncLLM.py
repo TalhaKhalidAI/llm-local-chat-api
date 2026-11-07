@@ -743,6 +743,8 @@ class AsyncLLM:
                 **repeat_penalty:** Penalty for repeating tokens.
                 **verbose:** Enable llama.cpp verbose logging.
                 **stop:** List of stop tokens.
+                **use_mmap:** Enable mmap for model loading in llama.cpp (default: True).
+                **use_mlock:** Lock model in memory in llama.cpp (default: False).
                 **
                 **queue_maxsize:** Maximum queue capacity.
                 **default_timeout:** Request timeout in seconds.
@@ -782,11 +784,12 @@ class AsyncLLM:
         }
         if self.model_path:
             self.path = self.model_path
-            self.setting = None  # No need for Settings
         else:
             try:
-                self.path = self.setting.MODEL_PATH
-            except (ValidationError, AttributeError):
+                self.path = getattr(self.setting, "MODEL_PATH", None) or getattr(self.setting, "LLM_MODEL_PATH", None)
+                if not self.path:
+                    raise ValueError("MODEL_PATH not set.")
+            except Exception:
                 raise ValueError("MODEL_PATH not set. Provide it via .env or pass model_path argument.")
         
 
@@ -796,18 +799,22 @@ class AsyncLLM:
         self._shutdown_event = asyncio.Event()
         self.lock = asyncio.Lock()
         self._future_lock = asyncio.Lock()
-        # Default generation parameters
-        self.temperature = kwargs.get("temperature", 0.1)
-        self.top_p = kwargs.get("top_p", 0.9)
-        self.top_k = kwargs.get("top_k", 30)
+        # Infrastructure / Model Loading (Hardware allocation at startup)
+        self.n_batch = kwargs.get("n_batch", getattr(self.setting, "LLM_N_BATCH", 512))
+        self.n_ctx = kwargs.get("n_ctx", getattr(self.setting, "LLM_N_CTX", 16384)) 
+        self.n_threads = kwargs.get("n_threads", getattr(self.setting, "LLM_N_THREADS", 6))
+        self.n_gpu_layers = kwargs.get("n_gpu_layers", getattr(self.setting, "LLM_N_GPU_LAYERS", -1))
+        self.verbose = kwargs.get("verbose", getattr(self.setting, "LLM_VERBOSE", False))
+        self.use_mmap = kwargs.get("use_mmap", getattr(self.setting, "USE_MMAP", True))
+        self.use_mlock = kwargs.get("use_mlock", getattr(self.setting, "USE_MLOCK", False))
+
+        # Default fallback generation parameters (used when API caller omits them)
+        self.temperature = kwargs.get("temperature", getattr(self.setting, "DEFAULT_TEMPERATURE", 0.7))
+        self.top_p = kwargs.get("top_p", getattr(self.setting, "DEFAULT_TOP_P", 0.9))
+        self.top_k = kwargs.get("top_k", getattr(self.setting, "DEFAULT_TOP_K", 40))
         self.streaming = kwargs.get("streaming", False)
-        self.repeat_penalty = kwargs.get("repeat_penalty", None)
-        self.n_predict = kwargs.get("n_predict", 2048)
-        self.n_batch = kwargs.get("n_batch", 128)
-        self.n_ctx = kwargs.get("n_ctx", 16384) 
-        self.n_threads = kwargs.get("n_threads", 6)
-        self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
-        self.verbose = kwargs.get("verbose", False)
+        self.repeat_penalty = kwargs.get("repeat_penalty", getattr(self.setting, "DEFAULT_REPEAT_PENALTY", 1.1))
+        self.n_predict = kwargs.get("n_predict", getattr(self.setting, "DEFAULT_MAX_TOKENS", 2048))
         self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
         self._stream_lock = asyncio.Lock()
         self._stream_tasks: Dict[str, asyncio.Task] = {}
@@ -869,18 +876,14 @@ class AsyncLLM:
                 if avail < self.config.available_ram:
                     raise MemoryError(f"Need {self.config.available_ram/1000}GB free, have {avail:.0f}MB")
 
-                self.temperature = kwargs.get("temperature", 0.1)
-                self.top_p = kwargs.get("top_p", 0.9)
-                self.top_k = kwargs.get("top_k", 30)
-                self.streaming = kwargs.get("streaming", False)
-                self.repeat_penalty = kwargs.get("repeat_penalty", None)
-                self.n_predict = kwargs.get("n_predict", 2048)
-                self.n_batch = kwargs.get("n_batch", 128)
-                self.n_ctx = kwargs.get("n_ctx", 16384)
-                self.n_threads = kwargs.get("n_threads", 6)
-                self.n_gpu_layers = kwargs.get("n_gpu_layers", -1)
-                self.verbose = kwargs.get("verbose", False)
-                self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
+                # Hardware / Infrastructure parameters for loading model
+                self.n_batch = kwargs.get("n_batch", self.n_batch)
+                self.n_ctx = kwargs.get("n_ctx", self.n_ctx)
+                self.n_threads = kwargs.get("n_threads", self.n_threads)
+                self.n_gpu_layers = kwargs.get("n_gpu_layers", self.n_gpu_layers)
+                self.verbose = kwargs.get("verbose", self.verbose)
+                self.use_mmap = kwargs.get("use_mmap", self.use_mmap)
+                self.use_mlock = kwargs.get("use_mlock", self.use_mlock)
 
                 if model_name in self.current_model:
                     raise ValueError(f"Model '{model_name}' already loaded")
@@ -894,22 +897,25 @@ class AsyncLLM:
                     else:
                         raise FileNotFoundError(f"Model '{model_name}' not found in '{self.path}'")
 
-                logger.info(f"Loading model: {fmp} (temp={self.temperature}, max_tokens={self.n_predict}, gpu_layers={self.n_gpu_layers})")
+                logger.info(
+                    f"Loading model: {fmp} ("
+                    f"n_ctx={self.n_ctx}, "
+                    f"n_gpu_layers={self.n_gpu_layers}, "
+                    f"n_batch={self.n_batch}, "
+                    f"n_threads={self.n_threads}, "
+                    f"use_mmap={self.use_mmap}, "
+                    f"use_mlock={self.use_mlock})"
+                )
                 llm = await asyncio.to_thread(
                     llama_cpp.Llama,
                     model_path=fmp,
-                    temperature=self.temperature,
-                    top_p=self.top_p,
-                    top_k=self.top_k,
-                    streaming=self.streaming,
-                    repeat_penalty=self.repeat_penalty,
-                    n_predict=self.n_predict,
                     n_batch=self.n_batch,
                     n_ctx=self.n_ctx,
                     n_threads=self.n_threads,
                     n_gpu_layers=self.n_gpu_layers,
                     verbose=self.verbose,
-                    stop=self.stops,
+                    use_mmap=self.use_mmap,
+                    use_mlock=self.use_mlock,
                 )
                 self.current_model[model_name] = llm
                 logger.info(f"Model '{model_name}' loaded successfully")
@@ -955,21 +961,43 @@ class AsyncLLM:
                     future.set_exception(e)
                     continue           
                 try:
+                    # Resolve per-request generation parameters with fallbacks
+                    repeat_penalty_val = task.get("repeat_penalty")
+                    if repeat_penalty_val is None:
+                        repeat_penalty_val = self.repeat_penalty if self.repeat_penalty is not None else 1.0
+
+                    max_tokens_val = task.get("max_tokens")
+                    if max_tokens_val is None:
+                        max_tokens_val = self.n_predict
+
+                    temp_val = task.get("temperature")
+                    if temp_val is None:
+                        temp_val = self.temperature
+
+                    top_p_val = task.get("top_p")
+                    if top_p_val is None:
+                        top_p_val = self.top_p
+
+                    top_k_val = task.get("top_k")
+                    if top_k_val is None:
+                        top_k_val = self.top_k
+
+                    stop_val = task.get("stop")
+                    if stop_val is None:
+                        stop_val = self.stops
+
                     if stream:
                         loop = asyncio.get_running_loop()
-                        repeat_penalty_val = task.get("repeat_penalty", self.repeat_penalty)
-                        if repeat_penalty_val is None:
-                            repeat_penalty_val = 1.0
                         
                         def generate():
                             generator = model(
                                 prompt,
-                                max_tokens=task.get("max_tokens", self.n_predict),
-                                temperature=task.get("temperature", self.temperature),
-                                top_p=task.get("top_p", self.top_p),
-                                top_k=task.get("top_k", self.top_k),
+                                max_tokens=max_tokens_val,
+                                temperature=temp_val,
+                                top_p=top_p_val,
+                                top_k=top_k_val,
                                 stream=True,
-                                stop=task.get("stop", self.stops),
+                                stop=stop_val,
                                 repeat_penalty=repeat_penalty_val,
                             )
                             try:
@@ -986,19 +1014,16 @@ class AsyncLLM:
                         await asyncio.to_thread(generate)
                     else:
                         logger.info(f"Processing request {task_id}: {prompt[:50]}...")
-                        repeat_penalty_val = task.get("repeat_penalty", self.repeat_penalty)
-                        if repeat_penalty_val is None:
-                            repeat_penalty_val = 1.0
                         
                         raw_response = await asyncio.to_thread(
                             model,
                             prompt,
-                            max_tokens=task.get("max_tokens", self.n_predict),
-                            temperature=task.get("temperature", self.temperature),
-                            top_p=task.get("top_p", self.top_p),
-                            top_k=task.get("top_k", self.top_k),
+                            max_tokens=max_tokens_val,
+                            temperature=temp_val,
+                            top_p=top_p_val,
+                            top_k=top_k_val,
                             stream=False,
-                            stop=task.get("stop", self.stops),
+                            stop=stop_val,
                             repeat_penalty=repeat_penalty_val,
                         )
                         
@@ -1153,9 +1178,9 @@ class AsyncLLM:
             "timestamp": time.time(),
             "stream": False,
         }
-        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty","model_id","user_id"]
+        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty", "model_id", "user_id"]
         for p in allowed_params:
-            if p in gen_kwargs:
+            if p in gen_kwargs and gen_kwargs[p] is not None:
                 task_params[p] = gen_kwargs[p]
         
         try:
@@ -1219,9 +1244,9 @@ class AsyncLLM:
             "stream": True,
             "stream_queue": stream_queue,
         }
-        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty","model_id","user_id"]
+        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty", "model_id", "user_id"]
         for p in allowed_params:
-            if p in gen_kwargs:
+            if p in gen_kwargs and gen_kwargs[p] is not None:
                 task_params[p] = gen_kwargs[p]
 
         await self.queue.put(task_params)

@@ -29,6 +29,8 @@ class llmChatRepo(AsyncLLM):
             repeat_penalty: Penalty for repeating tokens.
             verbose: Enable llama.cpp verbose logging.
             stop: List of stop tokens.
+            use_mmap: Enable mmap for model loading in llama.cpp (default: True).
+            use_mlock: Lock model in memory in llama.cpp (default: False).
             queue_maxsize: Maximum queue capacity.
             default_timeout: Request timeout in seconds.
             auto_restart_worker: Auto-restart worker on crash.
