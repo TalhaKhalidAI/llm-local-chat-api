@@ -1,0 +1,63 @@
+# Dockerfile - COMPLETE FIXED
+FROM python:3.10-slim
+
+# ============================================
+# 1. ALL System Dependencies for Vulkan Build
+# ============================================
+RUN apt-get update && apt-get install -y --fix-missing \
+    curl wget git \
+    build-essential cmake ninja-build pkg-config \
+    libvulkan1 libvulkan-dev vulkan-tools \
+    mesa-vulkan-drivers \
+    glslc \
+    spirv-headers spirv-tools \
+    libsqlite3-dev dnsutils iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# Verify Vulkan components are installed
+RUN glslc --version && echo "✅ glslc installed"
+RUN ls -la /usr/include/vulkan/ && echo "✅ Vulkan headers installed"
+RUN ls -la /usr/include/spirv/ 2>/dev/null || echo "⚠️ SPIRV headers may be in another location"
+
+# ============================================
+# 2. Install Python dependencies
+# ============================================
+WORKDIR /app
+COPY requirements.txt ./
+
+# Install Python packages
+RUN grep -v "llama-cpp-python" requirements.txt > requirements.no-llama.txt && \
+    pip install --no-cache-dir --timeout=100 -r requirements.no-llama.txt
+
+# ============================================
+# 3. Install llama-cpp-python with Vulkan support
+# ============================================
+# Set Vulkan paths explicitly
+ENV VULKAN_SDK=/usr
+ENV VULKAN_LIBRARY=/usr/lib/x86_64-linux-gnu/libvulkan.so.1
+ENV VULKAN_INCLUDE_DIR=/usr/include
+
+# Use CMAKE_ARGS to find all required dependencies
+RUN CMAKE_ARGS="-DGGML_VULKAN=ON \
+    -DVulkan_LIBRARY=/usr/lib/x86_64-linux-gnu/libvulkan.so.1 \
+    -DVulkan_INCLUDE_DIR=/usr/include \
+    -DSPIRV-Headers_DIR=/usr/include" \
+    pip install --no-cache-dir llama-cpp-python
+
+# ============================================
+# 4. Copy application
+# ============================================
+COPY . .
+
+RUN mkdir -p /logs /models
+
+# ============================================
+# 5. Environment variables
+# ============================================
+ENV PYTHONUNBUFFERED=1
+ENV LOG_FILEPATH=/logs
+ENV LLM_MODEL_PATH=/models
+ENV GGML_VK_ALLOW_GRAPHICS_QUEUE=1
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

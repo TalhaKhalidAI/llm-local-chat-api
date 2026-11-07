@@ -1,0 +1,55 @@
+# Dockerfile3 - FIXED with diskcache dependency
+FROM python:3.10-slim
+
+# ============================================
+# 1. ALL System Dependencies for Vulkan
+# ============================================
+RUN apt-get update && apt-get install -y --fix-missing \
+    curl wget git \
+    build-essential cmake ninja-build pkg-config \
+    libvulkan1 libvulkan-dev vulkan-tools \
+    mesa-vulkan-drivers \
+    glslc \
+    spirv-headers spirv-tools \
+    libsqlite3-dev dnsutils iputils-ping \
+    && rm -rf /var/lib/apt/lists/*
+
+# ============================================
+# 2. Install Python dependencies
+# ============================================
+WORKDIR /app
+COPY requirements.txt ./
+
+RUN grep -v "llama-cpp-python" requirements.txt > requirements.no-llama.txt && \
+    pip install --no-cache-dir --timeout=100 -r requirements.no-llama.txt
+
+# ============================================
+# 3. 🔥 FIXED: Install diskcache first (dependency for vulkan wheel)
+# ============================================
+RUN pip install --no-cache-dir diskcache>=5.6.1
+
+# ============================================
+# 4. Install llama-cpp-python with Vulkan
+# ============================================
+RUN pip install --no-cache-dir \
+    --index-url https://abetlen.github.io/llama-cpp-python/whl/vulkan \
+    llama-cpp-python
+
+# ============================================
+# 5. Copy application
+# ============================================
+COPY . .
+
+RUN mkdir -p /logs /models
+
+# ============================================
+# 6. Environment variables
+# ============================================
+ENV PYTHONUNBUFFERED=1
+ENV LOG_FILEPATH=/logs
+ENV LLM_MODEL_PATH=/models
+ENV GGML_VK_ALLOW_GRAPHICS_QUEUE=1
+ENV GGML_VULKAN_DEVICE=0
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -9,7 +9,6 @@ dependencies = [
     "langchain",
     "langchain-community",
     "langchain-core",
-    
     # Local Model & Data Handling
     "langchain-huggingface",
     "sentence-transformers",
@@ -17,40 +16,33 @@ dependencies = [
     "pydantic>=2.0.0",
     "pydantic-settings",
     "contextvars",
-    
     # Vector Store & Data
     "chromadb",
     "langchain-chroma",
     "numpy",
-    
     # Utilities
     "python-dotenv",
     "tqdm",
     "aiohttp",
     "psutil",
     "PyYAML",
-    
     # LangChain Ecosystem
     "langchain-text-splitters",
     "langchain-openai",
     "langchain-groq",
     "langgraph",
     "langsmith",
-    
     # AI & Model Tools
     "transformers",
     "torch",
     "tokenizers",
     "onnxruntime<=1.19.2",  # ✅ ADD THIS - compatible with Python 3.10
-    
     # Data & Vector Storage
     "SQLAlchemy",
     "faiss-cpu",
-    
     # Utilities & Performance
     "rich",
     "typing-extensions",
-    
     # FastAPI & Server
     "fastapi",
     "uvicorn[standard]",
@@ -60,47 +52,40 @@ dependencies = [
     "watchfiles",
     "websockets",
     "python-multipart",
-    
     # Database
     "asyncpg",
     "psycopg2-binary",
     "aiosqlite",
     "alembic",
     "databases",
-    
     # Authentication & Security
     "python-jose",
     "passlib",
     "bcrypt",
     "cryptography",
     "email-validator",
-    
     # Async & Networking
     "anyio",
     "httpcore",
     "httpx",
     "backoff",
     "tenacity",
-    
     # Middleware & Utilities
     "slowapi",
     "asgi-correlation-id",
     "sentry-sdk",
     "limits",
-    
     # Development & Debugging
     "ipython",
     "ipykernel",
     "debugpy",
     "click",
     "typer",
-    
     # Serialization & Data
     "orjson",
     "msgpack",
     "tomli",
     "tomlkit",
-    
     # Misc
     "packaging",
     "platformdirs",
@@ -109,6 +94,7 @@ dependencies = [
     "shellingham",
     "rich-toolkit",
     "typing-inspection",
+    "argon2-cffi>=25.1.0",
 ]
 
 [[tool.uv.index]]
