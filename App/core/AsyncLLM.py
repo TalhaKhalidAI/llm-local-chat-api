@@ -793,7 +793,8 @@ class AsyncLLM:
                 raise ValueError("MODEL_PATH not set. Provide it via .env or pass model_path argument.")
         
 
-        self.queue = asyncio.Queue(maxsize=self.config.queue_maxsize)
+        self.waiting_queue = asyncio.Queue(maxsize=self.config.queue_maxsize)
+        self.queue = self.waiting_queue  # Backwards-compatible alias
         self._running_event = asyncio.Event()
         self._worker_task = None
         self._shutdown_event = asyncio.Event()
@@ -807,6 +808,12 @@ class AsyncLLM:
         self.verbose = kwargs.get("verbose", getattr(self.setting, "LLM_VERBOSE", False))
         self.use_mmap = kwargs.get("use_mmap", getattr(self.setting, "USE_MMAP", True))
         self.use_mlock = kwargs.get("use_mlock", getattr(self.setting, "USE_MLOCK", False))
+
+        # Continuous Batching Slots & Scheduler State
+        self.continuous_batch_slots = int(kwargs.get("continuous_batch_slots", getattr(self.setting, "LLM_CONTINUOUS_BATCH_SLOTS", 2)))
+        self._model_slots: Dict[str, List[llama_cpp.Llama]] = {}
+        self._available_slots: asyncio.Queue = asyncio.Queue()
+        self._active_slot_tasks: Dict[str, asyncio.Task] = {}
 
         # Default fallback generation parameters (used when API caller omits them)
         self.temperature = kwargs.get("temperature", getattr(self.setting, "DEFAULT_TEMPERATURE", 0.7))
@@ -831,7 +838,11 @@ class AsyncLLM:
     async def get_metrics(self) -> Dict[str, Any]:
         async with self._metrics_lock:
             metrics = self._metrics.copy()
-            metrics["queue_size"] = self.queue.qsize()
+            metrics["waiting_queue_size"] = self.waiting_queue.qsize()
+            metrics["queue_size"] = self.waiting_queue.qsize()
+            metrics["active_batch_slots"] = self.continuous_batch_slots - self._available_slots.qsize()
+            metrics["available_slots"] = self._available_slots.qsize()
+            metrics["total_batch_slots"] = self.continuous_batch_slots
             metrics["active_streams"] = len(self._active_streams)
             metrics["models_loaded"] = len(self.current_model)
             return metrics
@@ -842,12 +853,14 @@ class AsyncLLM:
             if request_id in self.futures and not self.futures[request_id].done():
                 self.futures[request_id].set_exception(asyncio.CancelledError(f"Request {request_id} cancelled"))
                 logger.info(f"Cancelled request {request_id}")
-                return
         
         if request_id in self._stream_cancel_flags:
             self._stream_cancel_flags[request_id].set()
-            logger.info(f"Cancelled stream {request_id}")
-            return
+            logger.info(f"Signalled cancel to stream {request_id}")
+            
+        if request_id in self._active_slot_tasks:
+            self._active_slot_tasks[request_id].cancel()
+            logger.info(f"Cancelled active slot task for request {request_id}")
         
         logger.warning(f"Request {request_id} not found")
     # ------------------------ Model Management ------------------------
@@ -898,7 +911,7 @@ class AsyncLLM:
                         raise FileNotFoundError(f"Model '{model_name}' not found in '{self.path}'")
 
                 logger.info(
-                    f"Loading model: {fmp} ("
+                    f"Loading primary slot for model: {fmp} ("
                     f"n_ctx={self.n_ctx}, "
                     f"n_gpu_layers={self.n_gpu_layers}, "
                     f"n_batch={self.n_batch}, "
@@ -918,7 +931,37 @@ class AsyncLLM:
                     use_mlock=self.use_mlock,
                 )
                 self.current_model[model_name] = llm
-                logger.info(f"Model '{model_name}' loaded successfully")
+                slots = [llm]
+
+                # Initialize additional continuous batch slots sharing model weights via mmap
+                if self.continuous_batch_slots > 1:
+                    logger.info(f"Initializing {self.continuous_batch_slots - 1} additional continuous batching slot(s)...")
+                    for s_idx in range(1, self.continuous_batch_slots):
+                        slot_llm = await asyncio.to_thread(
+                            llama_cpp.Llama,
+                            model_path=fmp,
+                            n_batch=self.n_batch,
+                            n_ctx=self.n_ctx,
+                            n_threads=self.n_threads,
+                            n_gpu_layers=self.n_gpu_layers,
+                            verbose=False,
+                            use_mmap=self.use_mmap,
+                            use_mlock=self.use_mlock,
+                        )
+                        slots.append(slot_llm)
+
+                self._model_slots[model_name] = slots
+
+                # Populate available continuous batching slot indices
+                while not self._available_slots.empty():
+                    try:
+                        self._available_slots.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                for s_idx in range(len(slots)):
+                    await self._available_slots.put(s_idx)
+
+                logger.info(f"Model '{model_name}' loaded successfully with {len(slots)} continuous batching slot(s)")
                 return llm
             except Exception as e:
                 logger.error(f"Failed to load model: {e}")
@@ -943,124 +986,158 @@ class AsyncLLM:
                 self._worker_task.add_done_callback(self._worker_done_callback)
 
     async def _worker(self):
+        """
+        Continuous Batching Scheduler.
+        Continuously admits incoming requests from the waiting queue into available execution
+        slots as soon as any slot becomes free, eliminating head-of-line blocking.
+        """
+        logger.info(f"Continuous Batching Scheduler active with {self.continuous_batch_slots} execution slot(s).")
         while self._running_event.is_set():
             task = None
             try:
-                task = await asyncio.wait_for(self.queue.get(), timeout=5.0)
-                task_id = task["task_id"]
-                prompt = task["prompt"]
-                future = task["future"]
-                stream = task.get("stream", False)
-                stream_queue = task.get("stream_queue")
-                model_id=task.get("model_id")
-                user_id=task.get("user_id")
-                # ✅ Acquire model with counter
-                try:
-                    model = await self._acquire_model()
-                except ValueError as e:
-                    future.set_exception(e)
-                    continue           
-                try:
-                    # Resolve per-request generation parameters with fallbacks
-                    repeat_penalty_val = task.get("repeat_penalty")
-                    if repeat_penalty_val is None:
-                        repeat_penalty_val = self.repeat_penalty if self.repeat_penalty is not None else 1.0
-
-                    max_tokens_val = task.get("max_tokens")
-                    if max_tokens_val is None:
-                        max_tokens_val = self.n_predict
-
-                    temp_val = task.get("temperature")
-                    if temp_val is None:
-                        temp_val = self.temperature
-
-                    top_p_val = task.get("top_p")
-                    if top_p_val is None:
-                        top_p_val = self.top_p
-
-                    top_k_val = task.get("top_k")
-                    if top_k_val is None:
-                        top_k_val = self.top_k
-
-                    stop_val = task.get("stop")
-                    if stop_val is None:
-                        stop_val = self.stops
-
-                    if stream:
-                        loop = asyncio.get_running_loop()
-                        
-                        def generate():
-                            generator = model(
-                                prompt,
-                                max_tokens=max_tokens_val,
-                                temperature=temp_val,
-                                top_p=top_p_val,
-                                top_k=top_k_val,
-                                stream=True,
-                                stop=stop_val,
-                                repeat_penalty=repeat_penalty_val,
-                            )
-                            try:
-                                for chunk in generator:
-                                    token = chunk["choices"][0]["text"]
-                                    asyncio.run_coroutine_threadsafe(stream_queue.put(token), loop)
-                            except Exception as e:
-                                asyncio.run_coroutine_threadsafe(stream_queue.put(e), loop)
-                            finally:
-                                asyncio.run_coroutine_threadsafe(stream_queue.put(None), loop)
-                                if not future.done():
-                                    loop.call_soon_threadsafe(future.set_result, None)
-                        
-                        await asyncio.to_thread(generate)
-                    else:
-                        logger.info(f"Processing request {task_id}: {prompt[:50]}...")
-                        
-                        raw_response = await asyncio.to_thread(
-                            model,
-                            prompt,
-                            max_tokens=max_tokens_val,
-                            temperature=temp_val,
-                            top_p=top_p_val,
-                            top_k=top_k_val,
-                            stream=False,
-                            stop=stop_val,
-                            repeat_penalty=repeat_penalty_val,
-                        )
-                        
-                        if isinstance(raw_response, dict) and "choices" in raw_response:
-                            finish_reason = raw_response["choices"][0].get("finish_reason")
-                            if finish_reason == "length":
-                                logger.warning(f"Request {task_id} stopped due to max_tokens limit")
-                            elif finish_reason == "stop":
-                                logger.info(f"Request {task_id} stopped by stop token")
-                        
-                        if not future.done():
-                            # Create AIMessage with content and full raw response as metadata
-                            content = self._extract_content(raw_response)
-                            message = AIMessage(content=content, response_metadata={
-                                **raw_response,
-                                "model_id":model_id,
-                                "user_id":user_id,
-                                "task_id":task_id
-                            })
-                            future.set_result(message)
-                        logger.info(f"Request {task_id} completed")
-                finally:
-                    # ✅ Always release model
-                    await self._release_model()
-
+                task = await asyncio.wait_for(self.waiting_queue.get(), timeout=1.0)
             except asyncio.TimeoutError:
                 continue
             except asyncio.CancelledError:
-                logger.info("Worker cancelled")
                 break
-            except Exception as e:
-                logger.error(f"Worker error: {e}", exc_info=True)
-                if task and "future" in task and not task["future"].done():
-                    task["future"].set_exception(e)
-            finally:
-                if task:
-                    self.queue.task_done()
+
+            task_id = task["task_id"]
+            future = task["future"]
+
+            if future.cancelled() or future.done():
+                self.waiting_queue.task_done()
+                continue
+
+            # Wait for next available continuous batch slot
+            try:
+                slot_id = await self._available_slots.get()
+            except asyncio.CancelledError:
+                if not future.done():
+                    future.set_exception(asyncio.CancelledError("Service stopping"))
+                self.waiting_queue.task_done()
+                break
+
+            slot_task = asyncio.create_task(self._run_slot(slot_id, task))
+            self._active_slot_tasks[task_id] = slot_task
+
+    async def _run_slot(self, slot_id: int, task: dict):
+        """Execute inference for a single request inside an assigned continuous batch slot."""
+        task_id = task["task_id"]
+        prompt = task["prompt"]
+        future = task["future"]
+        stream = task.get("stream", False)
+        stream_queue = task.get("stream_queue")
+        model_id = task.get("model_id")
+        user_id = task.get("user_id")
+
+        try:
+            model = await self._acquire_slot_model(slot_id)
+        except Exception as e:
+            if not future.done():
+                future.set_exception(e)
+            self.waiting_queue.task_done()
+            await self._available_slots.put(slot_id)
+            return
+
+        try:
+            # Resolve per-request generation parameters with fallbacks
+            repeat_penalty_val = task.get("repeat_penalty")
+            if repeat_penalty_val is None:
+                repeat_penalty_val = self.repeat_penalty if self.repeat_penalty is not None else 1.0
+
+            max_tokens_val = task.get("max_tokens")
+            if max_tokens_val is None:
+                max_tokens_val = self.n_predict
+
+            temp_val = task.get("temperature")
+            if temp_val is None:
+                temp_val = self.temperature
+
+            top_p_val = task.get("top_p")
+            if top_p_val is None:
+                top_p_val = self.top_p
+
+            top_k_val = task.get("top_k")
+            if top_k_val is None:
+                top_k_val = self.top_k
+
+            stop_val = task.get("stop")
+            if stop_val is None:
+                stop_val = self.stops
+
+            cancel_flag = self._stream_cancel_flags.get(task_id)
+
+            if stream:
+                loop = asyncio.get_running_loop()
+
+                def generate():
+                    generator = model(
+                        prompt,
+                        max_tokens=max_tokens_val,
+                        temperature=temp_val,
+                        top_p=top_p_val,
+                        top_k=top_k_val,
+                        stream=True,
+                        stop=stop_val,
+                        repeat_penalty=repeat_penalty_val,
+                    )
+                    try:
+                        for chunk in generator:
+                            if cancel_flag and cancel_flag.is_set():
+                                logger.info(f"Stream {task_id} aborted mid-generation in slot {slot_id}")
+                                break
+                            token = chunk["choices"][0]["text"]
+                            asyncio.run_coroutine_threadsafe(stream_queue.put(token), loop)
+                    except Exception as e:
+                        asyncio.run_coroutine_threadsafe(stream_queue.put(e), loop)
+                    finally:
+                        asyncio.run_coroutine_threadsafe(stream_queue.put(None), loop)
+                        if not future.done():
+                            loop.call_soon_threadsafe(future.set_result, None)
+
+                await asyncio.to_thread(generate)
+            else:
+                logger.info(f"[Slot {slot_id}] Processing request {task_id}: {prompt[:50]}...")
+
+                raw_response = await asyncio.to_thread(
+                    model,
+                    prompt,
+                    max_tokens=max_tokens_val,
+                    temperature=temp_val,
+                    top_p=top_p_val,
+                    top_k=top_k_val,
+                    stream=False,
+                    stop=stop_val,
+                    repeat_penalty=repeat_penalty_val,
+                )
+
+                if isinstance(raw_response, dict) and "choices" in raw_response:
+                    finish_reason = raw_response["choices"][0].get("finish_reason")
+                    if finish_reason == "length":
+                        logger.warning(f"[Slot {slot_id}] Request {task_id} stopped due to max_tokens limit")
+                    elif finish_reason == "stop":
+                        logger.info(f"[Slot {slot_id}] Request {task_id} stopped by stop token")
+
+                if not future.done():
+                    content = self._extract_content(raw_response)
+                    message = AIMessage(content=content, response_metadata={
+                        **raw_response,
+                        "model_id": model_id,
+                        "user_id": user_id,
+                        "task_id": task_id,
+                        "slot_id": slot_id,
+                    })
+                    future.set_result(message)
+                logger.info(f"[Slot {slot_id}] Request {task_id} completed")
+        except Exception as e:
+            logger.error(f"[Slot {slot_id}] Worker error: {e}", exc_info=True)
+            if not future.done():
+                future.set_exception(e)
+        finally:
+            await self._release_model()
+            self._active_slot_tasks.pop(task_id, None)
+            self.waiting_queue.task_done()
+            await self._available_slots.put(slot_id)
 
     async def start(self):
         if self._running_event.is_set():
@@ -1073,7 +1150,7 @@ class AsyncLLM:
         self._running_event.set()
         self._worker_task = asyncio.create_task(self._worker())
         self._worker_task.add_done_callback(self._worker_done_callback)
-        logger.info("Service started")
+        logger.info(f"Service started with Continuous Batching ({self.continuous_batch_slots} slots)")
 
     async def stop(self):
         if not self._running_event.is_set():
@@ -1094,15 +1171,22 @@ class AsyncLLM:
             flag.set()
         self._stream_cancel_flags.clear()
         
-        # 4. Cancel stream tasks
+        # 4. Cancel active stream tasks & continuous batch slot tasks
         for task_id, task in list(self._stream_tasks.items()):
             task.cancel()
             logger.info(f"Cancelled stream {task_id}")
         if self._stream_tasks:
             await asyncio.gather(*self._stream_tasks.values(), return_exceptions=True)
         self._stream_tasks.clear()
+
+        for task_id, task in list(self._active_slot_tasks.items()):
+            task.cancel()
+            logger.info(f"Cancelled continuous batch slot task {task_id}")
+        if self._active_slot_tasks:
+            await asyncio.gather(*self._active_slot_tasks.values(), return_exceptions=True)
+        self._active_slot_tasks.clear()
         
-        # 5. Stop the worker
+        # 5. Stop the scheduler worker
         if self._worker_task:
             self._worker_task.cancel()
             try:
@@ -1111,16 +1195,16 @@ class AsyncLLM:
                 pass
             self._worker_task = None
         
-        # 6. Fail pending futures in queue
+        # 6. Fail pending futures in waiting queue
         failed_count = 0
-        while not self.queue.empty():
+        while not self.waiting_queue.empty():
             try:
-                task = self.queue.get_nowait()
+                task = self.waiting_queue.get_nowait()
                 future = task.get("future")
                 if future and not future.done():
                     future.set_exception(RuntimeError("Service stopped"))
                     failed_count += 1
-                self.queue.task_done()
+                self.waiting_queue.task_done()
             except asyncio.QueueEmpty:
                 break
         
@@ -1370,7 +1454,14 @@ class AsyncLLM:
         try:
             logger.info(f"Unloading model: {model_name}")
             model = self.current_model.pop(model_name, None)
-            if model and hasattr(model, "close"):
+            slots = self._model_slots.pop(model_name, [])
+            for s in slots:
+                if hasattr(s, "close"):
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+            if model and hasattr(model, "close") and model not in slots:
                 try:
                     model.close()
                 except Exception:
@@ -1392,6 +1483,20 @@ class AsyncLLM:
                 libc.malloc_trim(0)
             except Exception:
                 pass
+
+    async def _acquire_slot_model(self, slot_id: int):
+        """Wait until unload is not in progress, then increment counter and return assigned slot model."""
+        await self._unload_allowed.wait()
+        async with self._model_lock:
+            self._active_requests += 1
+            async with self.lock:
+                if not self.current_model:
+                    raise ValueError("No model loaded")
+                model_name = list(self.current_model.keys())[0]
+                slots = self._model_slots.get(model_name)
+                if slots and slot_id < len(slots):
+                    return slots[slot_id]
+                return list(self.current_model.values())[0]
 
     async def _acquire_model(self):
         """Wait until unload is not in progress, then increment counter and return model."""

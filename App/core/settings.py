@@ -54,6 +54,12 @@ class Settings(BaseSettings):
         default=False,
         description="Enable llama.cpp verbose logging"
     )
+
+    # Continuous Batching Slots
+    LLM_CONTINUOUS_BATCH_SLOTS: int = Field(
+        default=2,
+        description="Number of parallel execution slots for continuous batching"
+    )
     
     # LLM Default Generation / Sampling Fallbacks (Inference runtime)
     DEFAULT_TEMPERATURE: float = Field(
@@ -257,6 +263,16 @@ class Settings(BaseSettings):
         if isinstance(v, str):
             return v.lower() in ('true', '1', 'yes', 'on')
         return bool(v)
+
+    @field_validator('LLM_CONTINUOUS_BATCH_SLOTS', mode='before')
+    @classmethod
+    def validate_batch_slots(cls, v: Any) -> int:
+        if v is None:
+            return 2
+        try:
+            return max(1, int(v))
+        except (ValueError, TypeError):
+            return 2
     
     # Computed properties
     @property
