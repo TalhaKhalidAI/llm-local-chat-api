@@ -1,10 +1,18 @@
- # FastAPI User Authentication & Management System
+# FastAPI Local LLM Chat API & Authentication System
 
-A production-ready FastAPI boilerplate with SQLite database, JWT authentication, and role-based access control.
+A high-performance FastAPI local LLM serving platform and authentication system with continuous batching, SQLite database, JWT authentication, and role-based access control.
 
 ## Made by Talha Khalid
 
 ## Features
+
+### LLM Serving & Chat Engine
+- **OpenAI-Compatible Chat API**: `/chat/completions` endpoint supporting standard chat formats.
+- **Continuous Batching Architecture**: Multi-slot scheduler for concurrent request processing without head-of-line blocking.
+- **Dynamic Sampling Controls**: Request-level control for temperature, top_p, top_k, max_tokens, repeat_penalty, and custom stop tokens with server fallback defaults.
+- **Hardware-Aware Loading**: Configurable GPU layer offloading (`n_gpu_layers`), CPU thread pinning (`n_threads`), batch sizes (`n_batch`), and context window sizes (`n_ctx`).
+- **Memory Optimization**: Memory-mapped file sharing (`use_mmap`) across batch slots and memory locking (`use_mlock`).
+- **Dynamic Model Lifecycle**: Hot-load and hot-unload GGUF models on the fly (`/load_model`, `/unload_model`, `/models`).
 
 ### Authentication
 - JWT-based authentication with Argon2 password hashing
@@ -95,6 +103,24 @@ ADMIN_PASSWORD=Admin@123
 # Environment
 ENVIRONMENT=development
 ALLOWED_ORIGINS=*
+
+# LLM Infrastructure / Model Loading (Hardware allocation at startup)
+LLM_MODEL_PATH=/path/to/your/models/directory
+LLM_N_CTX=4096
+LLM_N_GPU_LAYERS=0
+LLM_N_BATCH=128
+LLM_N_THREADS=6
+LLM_VERBOSE=false
+USE_MMAP=true
+USE_MLOCK=false
+LLM_CONTINUOUS_BATCH_SLOTS=2
+
+# LLM Default Generation / Sampling Fallbacks (Used if not passed in API request)
+DEFAULT_TEMPERATURE=0.4
+DEFAULT_TOP_P=0.9
+DEFAULT_TOP_K=40
+DEFAULT_MAX_TOKENS=1024
+DEFAULT_REPEAT_PENALTY=1.1
 ```
 
 ### 5. Run the application
@@ -105,6 +131,15 @@ uvicorn main:app --reload
 The API will be available at `http://localhost:8000`
 
 ## API Endpoints
+
+### LLM Chat & Model Management
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/chat/completions` | OpenAI-compatible chat completion (streaming & non-streaming) |
+| POST | `/load_model` | Hot-load a model by filename into memory/VRAM |
+| POST | `/unload_model` | Hot-unload current model and free memory/VRAM |
+| GET | `/models` | List all `.gguf` models available in `LLM_MODEL_PATH` |
+| GET | `/health` | Health check, queue metrics, and loaded model status |
 
 ### Authentication
 | Method | Endpoint | Description |
@@ -203,6 +238,30 @@ curl -X POST http://localhost:8000/app/v1/users/2/reset-password \
   }'
 ```
 
+### 7. LLM Chat Completion (OpenAI Compatible)
+```bash
+curl -X POST http://localhost:8000/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are a helpful software engineering assistant."
+      },
+      {
+        "role": "user",
+        "content": "Write a Python function to check for palindromes."
+      }
+    ],
+    "temperature": 0.4,
+    "max_tokens": 512,
+    "top_p": 0.9,
+    "top_k": 40,
+    "stream": false
+  }'
+```
+
 ## Project Structure
 
 ```
@@ -231,24 +290,47 @@ GptMobal/
 
 ## Environment Variables
 
+### Security & System Configuration
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | SECRET_KEY | Yes | - | JWT secret key (min 32 chars) |
 | ALGORITHM | Yes | HS256 | JWT algorithm |
-| ACCESS_TOKEN_EXPIRE_MINUTES | Yes | 790 | Token expiry time |
+| ACCESS_TOKEN_EXPIRE_MINUTES | Yes | 790 | Token expiry time in minutes |
 | SQLITE_DATABASE_URL | Yes | sqlite:///./app.db | Database URL |
-| LOG_FILEPATH | Yes | ./logs/ | Logs directory |
-| RATE_LIMIT_DEFAULT | Yes | 100/minute | Rate limit |
-| KILL_SWITCH_ENABLED | No | false | Maintenance mode |
+| LOG_FILEPATH | Yes | ./logs/ | Logs directory path |
+| RATE_LIMIT_DEFAULT | Yes | 100/minute | Default rate limit per client |
+| KILL_SWITCH_ENABLED | No | false | Global maintenance mode kill-switch |
 | MEMORY_COST | Yes | 65536 | Argon2 memory cost |
-| PARALLELISM | Yes | 2 | Argon2 parallelism |
+| PARALLELISM | Yes | 2 | Argon2 parallelism factor |
 | HASH_LENGTH | Yes | 32 | Argon2 hash length |
 | SALT_LENGTH | Yes | 16 | Argon2 salt length |
 | ADMIN_USERNAME | Yes | admin | Default admin username |
 | ADMIN_EMAIL | Yes | admin@example.com | Default admin email |
 | ADMIN_PASSWORD | Yes | Admin@123 | Default admin password |
-| ENVIRONMENT | No | development | Environment mode |
-| ALLOWED_ORIGINS | No | * | CORS origins |
+| ENVIRONMENT | No | development | Environment mode (`development` / `production`) |
+| ALLOWED_ORIGINS | No | * | CORS allowed origins (comma-separated) |
+
+### LLM Infrastructure & Hardware Configuration (Load Time)
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| LLM_MODEL_PATH | Yes | - | Path to the directory holding `.gguf` model files |
+| LLM_N_CTX | No | 4096 | KV cache context window size in tokens |
+| LLM_N_GPU_LAYERS | No | 0 | Layers offloaded to GPU (-1 or high number for all, 0 for CPU only) |
+| LLM_N_BATCH | No | 128 | Batch size for prompt evaluation / prefill |
+| LLM_N_THREADS | No | 6 | CPU threads per slot for matrix math operations |
+| LLM_VERBOSE | No | false | Enable verbose C++ logging from llama.cpp |
+| USE_MMAP | No | true | Memory-map model file for fast loading and zero-copy shared weights |
+| USE_MLOCK | No | false | Lock model pages in physical RAM (prevents disk swapping) |
+| LLM_CONTINUOUS_BATCH_SLOTS | No | 2 | Number of concurrent continuous batching execution slots |
+
+### LLM Default Generation & Sampling Fallbacks (Inference Runtime)
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| DEFAULT_TEMPERATURE | No | 0.4 | Default sampling temperature (0.0 = deterministic, 1.0 = creative) |
+| DEFAULT_TOP_P | No | 0.9 | Default nucleus top-p sampling probability |
+| DEFAULT_TOP_K | No | 40 | Default top-k token sampling cutoff |
+| DEFAULT_MAX_TOKENS | No | 1024 | Default maximum new tokens generated if omitted by client |
+| DEFAULT_REPEAT_PENALTY | No | 1.1 | Default penalty factor against repeating token patterns |
 
 ## Production Deployment
 
