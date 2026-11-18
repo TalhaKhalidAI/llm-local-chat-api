@@ -114,6 +114,9 @@ LLM_VERBOSE=false
 USE_MMAP=true
 USE_MLOCK=false
 LLM_CONTINUOUS_BATCH_SLOTS=2
+DEFAULT_TIMEOUT=160
+LLM_MIN_AVAILABLE_RAM_MB=3000
+STREAM_RESPONSE=false
 
 # LLM Default Generation / Sampling Fallbacks (Used if not passed in API request)
 DEFAULT_TEMPERATURE=0.4
@@ -322,6 +325,9 @@ GptMobal/
 | USE_MMAP | No | true | Memory-map model file for fast loading and zero-copy shared weights |
 | USE_MLOCK | No | false | Lock model pages in physical RAM (prevents disk swapping) |
 | LLM_CONTINUOUS_BATCH_SLOTS | No | 2 | Number of concurrent continuous batching execution slots |
+| DEFAULT_TIMEOUT | No | 160 | Default LLM generation timeout in seconds |
+| LLM_MIN_AVAILABLE_RAM_MB | No | 3000 | Minimum free system RAM required before loading the model |
+| STREAM_RESPONSE | No | false | Return chat completions as server-sent events instead of a normal JSON response |
 
 ### LLM Default Generation & Sampling Fallbacks (Inference Runtime)
 | Variable | Required | Default | Description |

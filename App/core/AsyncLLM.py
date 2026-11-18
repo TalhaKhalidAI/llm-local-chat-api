@@ -757,7 +757,13 @@ class AsyncLLM:
                 **available_ram:** Minimum RAM required (MB) before loading model.
             """
         # Load configuration
-        self.config = self.Config(**kwargs)
+        self.setting = Settings()
+        config_values = {
+            "default_timeout": self.setting.DEFAULT_TIMEOUT,
+            "available_ram": self.setting.LLM_MIN_AVAILABLE_RAM_MB,
+            **kwargs,
+        }
+        self.config = self.Config(**config_values)
 
         # Setup logging
         if not logger.handlers:
@@ -766,7 +772,6 @@ class AsyncLLM:
             logger.addHandler(handler)
             logger.setLevel(logging.INFO)
         self._metrics_lock = asyncio.Lock()
-        self.setting = Settings()
         self.model_path = kwargs.get("model_path")
         self._worker_exception_callback = kwargs.get("worker_exception_callback", None)
         self._auto_restart_worker = kwargs.get("auto_restart_worker", False)

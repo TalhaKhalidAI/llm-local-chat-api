@@ -60,6 +60,23 @@ class Settings(BaseSettings):
         default=2,
         description="Number of parallel execution slots for continuous batching"
     )
+
+    DEFAULT_TIMEOUT: float = Field(
+        default=160.0,
+        gt=0,
+        description="Default timeout for LLM generation requests in seconds"
+    )
+
+    LLM_MIN_AVAILABLE_RAM_MB: int = Field(
+        default=3000,
+        ge=0,
+        description="Minimum free RAM in MB required before loading the model"
+    )
+
+    STREAM_RESPONSE: bool = Field(
+        default=False,
+        description="Return chat completions as a server-sent event stream"
+    )
     
     # LLM Default Generation / Sampling Fallbacks (Inference runtime)
     DEFAULT_TEMPERATURE: float = Field(

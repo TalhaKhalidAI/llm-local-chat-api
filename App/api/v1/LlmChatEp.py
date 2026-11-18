@@ -2,8 +2,10 @@ from App.repository.llmRepository import llmChatRepo
 from fastapi import APIRouter, HTTPException, status, Request, Depends
 from App.models.llmModels import ChatChoice, ChatMessage, ChatRequest, ChatResponse
 from App.core.settings import settings
+from fastapi.responses import StreamingResponse
 from uuid import uuid4
 import time
+import json
 import traceback
 import logging
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -127,7 +129,7 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
         prompt_tokens_estimate = prompt_chars // 4
         logger.info(f"📝 Prompt: {prompt_chars} chars (~{prompt_tokens_estimate} tokens)")
         logger.info(f"📄 Preview: {prompt[:150]}...")
-        
+
         # ============================================
         # 3. CALL THE LLM with safe parameter handling
         # ============================================
@@ -145,6 +147,43 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
             gen_kwargs["stop"] = request.stop
         if getattr(request, 'repeat_penalty', None) is not None:
             gen_kwargs["repeat_penalty"] = request.repeat_penalty
+
+        if settings.STREAM_RESPONSE:
+            response_id = f"chatcmpl-{uuid4().hex[:8]}"
+            created = int(time.time())
+
+            async def stream_response():
+                def chunk(delta, finish_reason=None):
+                    return (
+                        "data: "
+                        + json.dumps({
+                            "id": response_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": request.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": delta,
+                                "finish_reason": finish_reason,
+                            }],
+                        })
+                        + "\n\n"
+                    )
+
+                yield chunk({"role": "assistant"})
+                async for token in repo.stream_llm(prompt, **gen_kwargs):
+                    yield chunk({"content": token})
+                yield chunk({}, finish_reason="stop")
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(
+                stream_response(),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache",
+                    "X-Accel-Buffering": "no",
+                },
+            )
         
         response = await repo.chat(
             prompt=prompt,
