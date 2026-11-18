@@ -41,3 +41,4 @@ logs
 *.csr
 keys
 uv.lock
+.env**
