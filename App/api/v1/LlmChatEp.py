@@ -39,6 +39,7 @@ _repo = llmChatRepo(
     use_mmap=settings.USE_MMAP,
     use_mlock=settings.USE_MLOCK,
     continuous_batch_slots=settings.LLM_CONTINUOUS_BATCH_SLOTS,
+    available_ram=settings.LLM_MIN_AVAILABLE_RAM_MB
 )
 
 def get_repo() -> llmChatRepo:
