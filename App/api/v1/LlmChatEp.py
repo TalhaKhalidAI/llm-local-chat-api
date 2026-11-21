@@ -1,9 +1,11 @@
 from App.repository.llmRepository import llmChatRepo
-from fastapi import APIRouter, HTTPException, status, Request, Depends
+from App.core.orchestrator import ChatOrchestrator
+from fastapi import APIRouter, HTTPException, status, Request, Depends, Query, File, Form, UploadFile
 from App.models.llmModels import ChatChoice, ChatMessage, ChatRequest, ChatResponse
 from App.core.settings import settings
 from fastapi.responses import StreamingResponse
 from uuid import uuid4
+import asyncio
 import time
 import json
 import traceback
@@ -46,39 +48,48 @@ def get_repo() -> llmChatRepo:
     """Dependency to get the repository instance."""
     return _repo
 
+_orchestrator = ChatOrchestrator(llm=_repo)
+
+def get_orchestrator() -> ChatOrchestrator:
+    """Dependency to get the orchestrator instance."""
+    return _orchestrator
+
 def split_large_messages(messages, splitter, max_chunk_size: int = 4000) -> str:
     """
     Build prompt from messages with automatic splitting of large content.
+    Supports both ChatMessage objects and plain dicts.
     """
     prompt = ""
     
     for msg in messages:
-        content = msg.content
+        role = msg["role"] if isinstance(msg, dict) else msg.role
+        raw_content = msg["content"] if isinstance(msg, dict) else msg.content
+        content = raw_content if isinstance(raw_content, str) else json.dumps(raw_content)
         
         # Check if content needs splitting
         if len(content) > max_chunk_size:
-            logger.info(f"📝 Splitting {msg.role} message: {len(content)} chars -> chunks")
+            logger.info(f"📝 Splitting {role} message: {len(content)} chars -> chunks")
             chunks = splitter.split_text(content)
             
             # Add each chunk with part numbering
             for i, chunk in enumerate(chunks):
                 part_label = f" (Part {i+1}/{len(chunks)})" if len(chunks) > 1 else ""
                 
-                if msg.role == "system":
+                if role == "system":
                     prompt += f"[SYSTEM]{part_label} {chunk}\n"
-                elif msg.role == "user":
+                elif role == "user":
                     prompt += f"[USER]{part_label} {chunk}\n"
-                elif msg.role == "assistant":
+                elif role == "assistant":
                     prompt += f"[ASSISTANT]{part_label} {chunk}\n"
             
             logger.info(f"✅ Split into {len(chunks)} chunks")
         else:
             # Normal content - no splitting needed
-            if msg.role == "system":
+            if role == "system":
                 prompt += f"[SYSTEM] {content}\n"
-            elif msg.role == "user":
+            elif role == "user":
                 prompt += f"[USER] {content}\n"
-            elif msg.role == "assistant":
+            elif role == "assistant":
                 prompt += f"[ASSISTANT] {content}\n"
     
     prompt += "[ASSISTANT] "
@@ -118,9 +129,23 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
                 )
         
         # ============================================
-        # 2. BUILD PROMPT FROM MESSAGES WITH SPLITTING
+        # 2. ORCHESTRATION (RAG + WEB SEARCH + VISION) -> BUILD PROMPT
         # ============================================
-        prompt = split_large_messages(request.messages, text_splitter)
+        orch_ctx = None
+        if getattr(request, "use_orchestrator", True) and settings.ORCH_ENABLED:
+            orch_ctx = await _orchestrator.prepare_context(
+                request.messages,
+                image_base64=getattr(request, "image_base64", None),
+                force_web=getattr(request, "use_web", None),
+                force_rag=getattr(request, "use_rag", None),
+            )
+            prompt = split_large_messages(orch_ctx.enriched_messages, text_splitter)
+            logger.info(
+                f"🧭 Orchestrator route={orch_ctx.route.model_dump()} | "
+                f"citations={len(orch_ctx.citations)} | metrics={orch_ctx.metrics_ms}"
+            )
+        else:
+            prompt = split_large_messages(request.messages, text_splitter)
         
         if not prompt or prompt == "[ASSISTANT] ":
             prompt = "[USER] Hello\n[ASSISTANT] "
@@ -149,7 +174,7 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
         if getattr(request, 'repeat_penalty', None) is not None:
             gen_kwargs["repeat_penalty"] = request.repeat_penalty
 
-        if settings.STREAM_RESPONSE:
+        if request.stream or settings.STREAM_RESPONSE:
             response_id = f"chatcmpl-{uuid4().hex[:8]}"
             created = int(time.time())
 
@@ -171,11 +196,26 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
                         + "\n\n"
                     )
 
+                collected: list[str] = []
                 yield chunk({"role": "assistant"})
-                async for token in repo.stream_llm(prompt, **gen_kwargs):
-                    yield chunk({"content": token})
+                async with _orchestrator.vram_gate:
+                    if not await repo.is_ready():
+                        await repo.initialize(model_name=request.model)
+                    async for token in repo.stream_llm(prompt, **gen_kwargs):
+                        collected.append(token)
+                        yield chunk({"content": token})
                 yield chunk({}, finish_reason="stop")
                 yield "data: [DONE]\n\n"
+                if orch_ctx is not None:
+                    try:
+                        await _orchestrator.memory.record_chat_turn(
+                            query=orch_ctx.user_query,
+                            answer="".join(collected),
+                            model_used=request.model,
+                            route=orch_ctx.route,
+                        )
+                    except Exception as rec_err:
+                        logger.warning(f"Failed to record streamed chat turn: {rec_err}")
 
             return StreamingResponse(
                 stream_response(),
@@ -186,12 +226,25 @@ async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Dep
                 },
             )
         
-        response = await repo.chat(
-            prompt=prompt,
-            **gen_kwargs
-        )
+        async with _orchestrator.vram_gate:
+            if not await repo.is_ready():
+                await repo.initialize(model_name=request.model)
+            response = await repo.chat(
+                prompt=prompt,
+                **gen_kwargs
+            )
         
         content = response if isinstance(response, str) else str(response)
+        if orch_ctx is not None:
+            try:
+                await _orchestrator.memory.record_chat_turn(
+                    query=orch_ctx.user_query,
+                    answer=content,
+                    model_used=request.model,
+                    route=orch_ctx.route,
+                )
+            except Exception as rec_err:
+                logger.warning(f"Failed to record chat turn: {rec_err}")
         
         logger.info(f"✅ LLM response received: {content[:100]}...")
         
@@ -498,3 +551,191 @@ async def get_dir_models(repo: llmChatRepo = Depends(get_repo)):
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error loading models: {e}"
         )
+
+
+# ============================================
+# ACTIVE MODEL ENDPOINT
+# ============================================
+
+@llmRouter.get("/active_model")
+async def get_active_model(repo: llmChatRepo = Depends(get_repo)):
+    """View the currently active/loaded model and runtime hardware configuration."""
+    is_ready = await repo.is_ready()
+    loaded_models = await repo.get_loaded_models_list()
+    return {
+        "ready": is_ready,
+        "active_model": loaded_models[0] if loaded_models else None,
+        "loaded_models": loaded_models,
+        "orchestrator_enabled": settings.ORCH_ENABLED,
+        "vision_model": settings.ORCH_VISION_MODEL,
+        "config": {
+            "n_ctx": repo.n_ctx,
+            "n_gpu_layers": repo.n_gpu_layers,
+            "n_batch": repo.n_batch,
+            "n_threads": repo.n_threads,
+            "continuous_batch_slots": repo.continuous_batch_slots,
+        },
+    }
+
+
+# ============================================
+# VECTOR DB HISTORY & SEARCH ENDPOINTS
+# ============================================
+
+@llmRouter.get("/history")
+async def view_vector_history(
+    collection: str = Query(default="chat_history", description="chat_history | web_cache | image_index | docs_rag"),
+    limit: int = Query(default=20, ge=1, le=100),
+    offset: int = Query(default=0, ge=0),
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """View stored records from the local ChromaDB vector store."""
+    try:
+        return await orch.memory.list_entries(collection_name=collection, limit=limit, offset=offset)
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error reading vector history: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@llmRouter.get("/history/search")
+async def search_vector_history(
+    q: str = Query(..., min_length=1, description="Semantic search query"),
+    collection: str = Query(default="chat_history", description="chat_history | web_cache | image_index | docs_rag"),
+    n_results: int = Query(default=5, ge=1, le=20),
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """Semantic search across ChromaDB history (chat turns, cached web pages, indexed images, docs)."""
+    if collection not in orch.memory.VALID_COLLECTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid collection '{collection}'. Choose from {orch.memory.VALID_COLLECTIONS}",
+        )
+    try:
+        hits = await orch.memory.query(collection_name=collection, query=q, n_results=n_results)
+        return {"query": q, "collection": collection, "count": len(hits), "results": hits}
+    except Exception as e:
+        logger.error(f"Error searching vector history: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ============================================
+# WEB SEARCH TEST ENDPOINT
+# ============================================
+
+@llmRouter.get("/web_search/test")
+async def test_web_search(
+    q: str = Query(..., min_length=2, description="Test query for DuckDuckGo + ChromaDB ingestion"),
+    bypass_cache: bool = Query(default=True, description="Set true to test live DuckDuckGo search"),
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """Test DuckDuckGo web search, safe scraping, and ChromaDB ingestion."""
+    t0 = time.perf_counter()
+    try:
+        results = await orch.web_tool.search_and_ingest(q, bypass_cache=bypass_cache)
+        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+        return {
+            "status": "ok" if results else "no_results",
+            "query": q,
+            "bypass_cache": bypass_cache,
+            "elapsed_ms": elapsed_ms,
+            "count": len(results),
+            "results": results,
+        }
+    except Exception as e:
+        logger.error(f"Web search test failed: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+# ============================================
+# IN-RAM IMAGE UPLOAD ENDPOINTS (NO DISK SAVE)
+# ============================================
+
+MAX_IMAGE_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB RAM guard
+
+
+@llmRouter.post("/vision/describe")
+async def describe_uploaded_image(
+    image: UploadFile = File(..., description="Image file processed strictly in RAM"),
+    prompt: str = Form(default="", description="Optional question or focus hint for Qwen2-VL"),
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """Upload an image -> decode in RAM with Qwen2-VL-2B -> index in ChromaDB (never saved to disk)."""
+    image_bytes = await image.read()
+    if not image_bytes:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded image is empty")
+    if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image exceeds 15MB limit")
+
+    try:
+        report = await orch.vision_tool.describe_and_index(image_bytes=image_bytes, user_hint=prompt)
+        return {"status": "ok", "vision_report": report.model_dump()}
+    except asyncio.QueueFull as qf:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(qf))
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Vision describe failed: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@llmRouter.post("/chat/completions/upload")
+async def chat_with_uploaded_image(
+    model: str = Form(...),
+    prompt: str = Form(...),
+    image: UploadFile | None = File(default=None, description="Optional image processed strictly in RAM"),
+    use_web: bool | None = Form(default=None),
+    use_rag: bool | None = Form(default=None),
+    temperature: float | None = Form(default=None),
+    max_tokens: int | None = Form(default=None),
+    repo: llmChatRepo = Depends(get_repo),
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """Chat with optional uploaded image + prompt -> Qwen2-VL in RAM -> RAG/Web -> active AsyncLLM completion."""
+    image_bytes: bytes | None = None
+    if image is not None and image.filename:
+        image_bytes = await image.read()
+        if not image_bytes:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded image is empty")
+        if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
+            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image exceeds 15MB limit")
+
+    try:
+        orch_ctx = await orch.prepare_context(
+            [{"role": "user", "content": prompt}],
+            image_bytes=image_bytes,
+            force_web=use_web,
+            force_rag=use_rag,
+        )
+        formatted_prompt = split_large_messages(orch_ctx.enriched_messages, text_splitter)
+        gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
+        async with orch.vram_gate:
+            if not await repo.is_ready():
+                await repo.initialize(model_name=model)
+            response = await repo.chat(prompt=formatted_prompt, **gen_kwargs)
+        content = response if isinstance(response, str) else str(response)
+
+        await orch.memory.record_chat_turn(
+            query=orch_ctx.user_query,
+            answer=content,
+            model_used=model,
+            route=orch_ctx.route,
+        )
+        return {
+            "id": f"chatcmpl-{uuid4().hex[:8]}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+            "vision_report": orch_ctx.vision_report.model_dump() if orch_ctx.vision_report else None,
+            "citations": [c.model_dump() for c in orch_ctx.citations],
+            "metrics_ms": orch_ctx.metrics_ms,
+        }
+    except asyncio.QueueFull as qf:
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(qf))
+    except ValueError as ve:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
+    except Exception as e:
+        logger.error(f"Error in upload chat completion: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))

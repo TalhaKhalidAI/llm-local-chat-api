@@ -1,6 +1,6 @@
 from contextlib import asynccontextmanager
 import os
-from fastapi import FastAPI, status, Request
+from fastapi import FastAPI, status, Request,applications
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -10,7 +10,10 @@ from slowapi.middleware import SlowAPIMiddleware
 from App.api.v1 import v1_router
 from App.core.settings import settings
 from App.core.LoggingInit import get_core_logger
-
+from fastapi.staticfiles import StaticFiles
+from fastapi.openapi.docs import get_swagger_ui_html
+import fastapi_offline_swagger_ui
+from pathlib import Path
 # Initialize Logger
 logger = get_core_logger(__name__)
 
@@ -71,7 +74,18 @@ app = FastAPI(title="Langchain API", version="0.0.1", lifespan=lifespan)
 app.state.limiter = limiter
 app.state.auto_kill_enabled = False  # Global flag for automatic protection
 
-
+assets_path = fastapi_offline_swagger_ui.__path__[0]
+if os.path.exists(assets_path + "/swagger-ui.css") and os.path.exists(assets_path + "/swagger-ui-bundle.js"):
+    app.mount("/assets", StaticFiles(directory=assets_path), name="static")
+    def swagger_monkey_patch(*args, **kwargs):
+        return get_swagger_ui_html(
+            *args,
+            **kwargs,
+            swagger_favicon_url="",
+            swagger_css_url="/assets/swagger-ui.css",
+            swagger_js_url="/assets/swagger-ui-bundle.js",
+        )
+    applications.get_swagger_ui_html = swagger_monkey_patch
 
 
 @app.exception_handler(RateLimitExceeded)

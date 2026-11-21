@@ -1,9 +1,9 @@
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 class ChatMessage(BaseModel):
     role: str
-    content: str
+    content: Union[str, List[Dict[str, Any]]]
 
 class ChatRequest(BaseModel):
     model: str
@@ -15,6 +15,11 @@ class ChatRequest(BaseModel):
     top_k: Optional[int] = Field(default=None, ge=0)
     stop: Optional[List[str]] = None
     repeat_penalty: Optional[float] = Field(default=None, ge=0.0)
+    # Orchestrator controls (optional, backwards-compatible, RAM-only image_base64)
+    use_orchestrator: bool = True
+    use_web: Optional[bool] = None
+    use_rag: Optional[bool] = None
+    image_base64: Optional[str] = None
 
 class ChatChoice(BaseModel):
     index: int

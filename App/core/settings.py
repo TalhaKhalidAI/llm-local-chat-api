@@ -77,6 +77,83 @@ class Settings(BaseSettings):
         default=False,
         description="Return chat completions as a server-sent event stream"
     )
+
+    # Orchestrator / RAG / Web Search / Vision Configuration
+    ORCH_ENABLED: bool = Field(
+        default=True,
+        description="Enable RAG, Web Search, and Vision orchestration on /chat/completions"
+    )
+    ORCH_CHROMA_DIR: str = Field(
+        default="./chroma_db",
+        description="Local disk path for persistent ChromaDB"
+    )
+    ORCH_CHROMA_HOST: str | None = Field(
+        default=None,
+        description="Optional ChromaDB server host"
+    )
+    ORCH_CHROMA_PORT: int = Field(
+        default=8001,
+        description="Optional ChromaDB server port"
+    )
+    ORCH_EMBEDDING_MODEL: str = Field(
+        default="BAAI/bge-small-en-v1.5",
+        description="CPU embedding model for ChromaDB"
+    )
+    ORCH_DDG_MAX_RESULTS: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Max DuckDuckGo results per search"
+    )
+    ORCH_WEB_CACHE_TTL_HOURS: int = Field(
+        default=24,
+        ge=1,
+        description="TTL in hours for cached web search chunks in ChromaDB"
+    )
+    ORCH_SCRAPE_TIMEOUT_SEC: float = Field(
+        default=5.0,
+        gt=0.5,
+        description="HTTP timeout for scraping web search URLs"
+    )
+    ORCH_SCRAPE_MAX_BYTES: int = Field(
+        default=1_500_000,
+        ge=10_000,
+        description="Max bytes to download per web page"
+    )
+    ORCH_CHUNK_SIZE_CHARS: int = Field(
+        default=1600,
+        ge=300,
+        description="Chunk size in characters for RAG ingestion"
+    )
+    ORCH_CHUNK_OVERLAP_CHARS: int = Field(
+        default=200,
+        ge=0,
+        description="Chunk overlap in characters"
+    )
+    ORCH_MAX_RAG_CHUNKS: int = Field(
+        default=4,
+        ge=1,
+        le=10,
+        description="Max retrieved chunks injected into prompt"
+    )
+    ORCH_MAX_DISTANCE: float = Field(
+        default=0.65,
+        ge=0.0,
+        le=2.0,
+        description="Max cosine distance threshold for ChromaDB retrieval"
+    )
+    ORCH_VISION_MODEL: str = Field(
+        default="/mnt/llm_models/LLM_Models/Qwen2-VL-2B-Instruct-Q4_K_M.gguf",
+        description="Path to Qwen2-VL GGUF model"
+    )
+    ORCH_VISION_MMPROJ: str = Field(
+        default="/mnt/llm_models/LLM_Models/mmproj-Qwen2-VL-2B-Instruct-f16.gguf",
+        description="Path to Qwen2-VL mmproj GGUF file"
+    )
+    ORCH_VISION_GPU_LAYERS: int = Field(
+        default=0,
+        description="GPU layers for Vision model (0 = CPU-only so main AsyncLLM stays loaded in VRAM; -1 = GPU swap)"
+    )
     
     # LLM Default Generation / Sampling Fallbacks (Inference runtime)
     DEFAULT_TEMPERATURE: float = Field(

@@ -42,3 +42,4 @@ logs
 keys
 uv.lock
 .env**
+chroma_db**
