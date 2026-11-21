@@ -830,11 +830,15 @@ class AsyncLLM:
         self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
         self._stream_lock = asyncio.Lock()
         self._stream_tasks: Dict[str, asyncio.Task] = {}
+        self._last_usage: Dict[str, Dict[str, int]] = {}
         # ✅ FIXED: Added missing attributes
         self._active_requests = 0
         self._unload_allowed = asyncio.Event()
         self._unload_allowed.set()
         self._model_lock = asyncio.Lock()
+    def pop_last_usage(self, task_id: str) -> Dict[str, int]:
+        return self._last_usage.pop(task_id, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+
     # ------------------------ Health & Metrics ------------------------
     async def is_healthy(self) -> bool:
         async with self.lock:
@@ -916,57 +920,51 @@ class AsyncLLM:
                         raise FileNotFoundError(f"Model '{model_name}' not found in '{self.path}'")
 
                 logger.info(
-                    f"Loading primary slot for model: {fmp} ("
+                    f"Loading single shared model for True Continuous Batching: {fmp} ("
                     f"n_ctx={self.n_ctx}, "
+                    f"n_seq_max={self.continuous_batch_slots}, "
                     f"n_gpu_layers={self.n_gpu_layers}, "
                     f"n_batch={self.n_batch}, "
                     f"n_threads={self.n_threads}, "
                     f"use_mmap={self.use_mmap}, "
                     f"use_mlock={self.use_mlock})"
                 )
-                llm = await asyncio.to_thread(
-                    llama_cpp.Llama,
-                    model_path=fmp,
-                    n_batch=self.n_batch,
-                    n_ctx=self.n_ctx,
-                    n_threads=self.n_threads,
-                    n_gpu_layers=self.n_gpu_layers,
-                    verbose=self.verbose,
-                    use_mmap=self.use_mmap,
-                    use_mlock=self.use_mlock,
-                )
+                def _load_shared_model():
+                    m = llama_cpp.Llama(
+                        model_path=fmp,
+                        n_batch=self.n_batch,
+                        n_ctx=self.n_ctx,
+                        n_threads=self.n_threads,
+                        n_gpu_layers=self.n_gpu_layers,
+                        verbose=self.verbose,
+                        use_mmap=self.use_mmap,
+                        use_mlock=self.use_mlock,
+                    )
+                    if self.continuous_batch_slots > 1:
+                        from llama_cpp._internals import LlamaContext
+                        cparams = m.context_params
+                        cparams.n_seq_max = self.continuous_batch_slots
+                        cparams.n_ctx = self.n_ctx
+                        m._ctx.close()
+                        m._ctx = LlamaContext(model=m._model, params=cparams)
+                    return m
+
+                llm = await asyncio.to_thread(_load_shared_model)
                 self.current_model[model_name] = llm
-                slots = [llm]
+                self._model_slots[model_name] = [llm]
 
-                # Initialize additional continuous batch slots sharing model weights via mmap
-                if self.continuous_batch_slots > 1:
-                    logger.info(f"Initializing {self.continuous_batch_slots - 1} additional continuous batching slot(s)...")
-                    for s_idx in range(1, self.continuous_batch_slots):
-                        slot_llm = await asyncio.to_thread(
-                            llama_cpp.Llama,
-                            model_path=fmp,
-                            n_batch=self.n_batch,
-                            n_ctx=self.n_ctx,
-                            n_threads=self.n_threads,
-                            n_gpu_layers=self.n_gpu_layers,
-                            verbose=False,
-                            use_mmap=self.use_mmap,
-                            use_mlock=self.use_mlock,
-                        )
-                        slots.append(slot_llm)
-
-                self._model_slots[model_name] = slots
-
-                # Populate available continuous batching slot indices
+                # Populate available continuous batching sequence IDs (0 .. n_seq_max - 1)
                 while not self._available_slots.empty():
                     try:
                         self._available_slots.get_nowait()
                     except asyncio.QueueEmpty:
                         break
-                for s_idx in range(len(slots)):
+                for s_idx in range(self.continuous_batch_slots):
                     await self._available_slots.put(s_idx)
 
-                logger.info(f"Model '{model_name}' loaded successfully with {len(slots)} continuous batching slot(s)")
+                logger.info(
+                    f"Model '{model_name}' loaded ONCE with {self.continuous_batch_slots} shared KV sequence slot(s)"
+                )
                 return llm
             except Exception as e:
                 logger.error(f"Failed to load model: {e}")
@@ -990,159 +988,393 @@ class AsyncLLM:
                 self._worker_task = asyncio.create_task(self._worker())
                 self._worker_task.add_done_callback(self._worker_done_callback)
 
+    async def format_messages_native(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> str:
+        """
+        Format messages using the loaded GGUF model's native Jinja2 chat_template.
+        Falls back cleanly to role-tagged prompt if no template is present.
+        """
+        async with self.lock:
+            model = list(self.current_model.values())[0] if self.current_model else None
+
+        if model is not None:
+            meta = getattr(model, "metadata", {}) or {}
+            template_str = meta.get("tokenizer.chat_template")
+            if template_str:
+                try:
+                    import jinja2
+
+                    vocab = llama_cpp.llama_model_get_vocab(model.model)
+                    bos_id = llama_cpp.llama_vocab_bos(vocab)
+                    eos_id = llama_cpp.llama_vocab_eos(vocab)
+                    bos_tok = model.detokenize([bos_id]).decode("utf-8", errors="ignore") if bos_id >= 0 else ""
+                    eos_tok = model.detokenize([eos_id]).decode("utf-8", errors="ignore") if eos_id >= 0 else ""
+
+                    env = jinja2.Environment(trim_blocks=False, lstrip_blocks=False)
+                    env.globals["raise_exception"] = lambda msg: (_ for _ in ()).throw(ValueError(msg))
+                    tpl = env.from_string(template_str)
+                    render_kwargs: Dict[str, Any] = {
+                        "messages": messages,
+                        "add_generation_prompt": True,
+                        "bos_token": bos_tok,
+                        "eos_token": eos_tok,
+                    }
+                    if tools:
+                        render_kwargs["tools"] = tools
+                    rendered = tpl.render(**render_kwargs)
+                    last_user = next((m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), "")
+                    if last_user and last_user[:40] not in rendered:
+                        raise ValueError("Template omitted user content")
+                    return rendered
+                except Exception as exc:
+                    logger.warning(f"Native chat_template render failed ({exc}); using fallback formatting")
+
+        parts = [f"[{m.get('role', 'user').upper()}] {m.get('content', '')}" for m in messages]
+        return "\n".join(parts) + "\n[ASSISTANT] "
+
+    @staticmethod
+    def _grammar_from_response_format(response_format: Optional[Dict[str, Any]]):
+        if not response_format or not isinstance(response_format, dict):
+            return None
+        rtype = response_format.get("type")
+        if rtype == "json_schema":
+            schema_obj = response_format.get("json_schema", {})
+            schema = schema_obj.get("schema", schema_obj) if isinstance(schema_obj, dict) else schema_obj
+            if schema:
+                return llama_cpp.LlamaGrammar.from_json_schema(json.dumps(schema))
+        if rtype == "json_object":
+            return llama_cpp.LlamaGrammar.from_json_schema(json.dumps({"type": "object"}))
+        return None
+
+    def _build_sampler(self, model: llama_cpp.Llama, task: dict):
+        """Build a per-sequence llama_sampler chain for continuous batching (with optional GBNF grammar)."""
+        temp = task.get("temperature")
+        temp = self.temperature if temp is None else float(temp)
+        top_k = task.get("top_k")
+        top_k = self.top_k if top_k is None else int(top_k)
+        top_p = task.get("top_p")
+        top_p = self.top_p if top_p is None else float(top_p)
+        repeat_penalty = task.get("repeat_penalty")
+        repeat_penalty = (self.repeat_penalty if self.repeat_penalty is not None else 1.0) if repeat_penalty is None else float(repeat_penalty)
+
+        sparams = llama_cpp.llama_sampler_chain_default_params()
+        chain = llama_cpp.llama_sampler_chain_init(sparams)
+        vocab = llama_cpp.llama_model_get_vocab(model.model)
+        n_vocab = llama_cpp.llama_vocab_n_tokens(vocab)
+
+        grammar_obj = self._grammar_from_response_format(task.get("response_format"))
+        if grammar_obj is not None:
+            llama_cpp.llama_sampler_chain_add(
+                chain,
+                llama_cpp.llama_sampler_init_grammar(
+                    vocab,
+                    grammar_obj._grammar.encode("utf-8"),
+                    grammar_obj._root.encode("utf-8"),
+                ),
+            )
+
+        llama_cpp.llama_sampler_chain_add(
+            chain,
+            llama_cpp.llama_sampler_init_penalties(n_vocab, 64, repeat_penalty, 0.0, 0.0),
+        )
+        if temp <= 0.0:
+            llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_greedy())
+        else:
+            if top_k > 0:
+                llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_top_k(top_k))
+            if 0.0 < top_p < 1.0:
+                llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_top_p(top_p, 1))
+            llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_temp(temp))
+            llama_cpp.llama_sampler_chain_add(chain, llama_cpp.llama_sampler_init_dist(int(time.time() * 1000) & 0xFFFFFFFF))
+        return chain
+
+    def _step_continuous_batch_sync(self, model: llama_cpp.Llama, active_seqs: Dict[int, dict]) -> List[tuple]:
+        """
+        Execute ONE true iteration-level continuous batching step across all active sequences.
+        Packs chunked prefill tokens + decode tokens into a single `llama_batch`, runs ONE
+        `llama_decode()`, and samples one token for every sequence ready for logits.
+        """
+        ctx = model.ctx
+        vocab = llama_cpp.llama_model_get_vocab(model.model)
+        n_batch_cap = max(1, int(self.n_batch))
+        batch = llama_cpp.llama_batch_init(n_batch_cap, 0, 1)
+        events: List[tuple] = []
+
+        try:
+            n_tokens = 0
+            logit_targets: List[tuple[int, int]] = []  # (batch_idx, seq_id)
+
+            # Pack decode tokens first (1 token each, low latency), then chunked prefill tokens
+            for seq_id, seq in active_seqs.items():
+                if seq["prefill_idx"] >= len(seq["prompt_tokens"]) and n_tokens < n_batch_cap:
+                    b_idx = n_tokens
+                    batch.token[b_idx] = seq["next_token"]
+                    batch.pos[b_idx] = seq["pos"]
+                    batch.n_seq_id[b_idx] = 1
+                    batch.seq_id[b_idx][0] = seq_id
+                    batch.logits[b_idx] = 1
+                    seq["pos"] += 1
+                    n_tokens += 1
+                    logit_targets.append((b_idx, seq_id))
+
+            for seq_id, seq in active_seqs.items():
+                p_tokens = seq["prompt_tokens"]
+                p_idx = seq["prefill_idx"]
+                while p_idx < len(p_tokens) and n_tokens < n_batch_cap:
+                    b_idx = n_tokens
+                    is_last_prompt_tok = (p_idx == len(p_tokens) - 1)
+                    batch.token[b_idx] = p_tokens[p_idx]
+                    batch.pos[b_idx] = seq["pos"]
+                    batch.n_seq_id[b_idx] = 1
+                    batch.seq_id[b_idx][0] = seq_id
+                    batch.logits[b_idx] = 1 if is_last_prompt_tok else 0
+                    seq["pos"] += 1
+                    p_idx += 1
+                    n_tokens += 1
+                    if is_last_prompt_tok:
+                        logit_targets.append((b_idx, seq_id))
+                seq["prefill_idx"] = p_idx
+
+            batch.n_tokens = n_tokens
+            if n_tokens == 0:
+                return events
+
+            rc = llama_cpp.llama_decode(ctx, batch)
+            if rc != 0:
+                raise RuntimeError(f"llama_decode failed with code {rc}")
+
+            for b_idx, seq_id in logit_targets:
+                seq = active_seqs[seq_id]
+                tok = llama_cpp.llama_sampler_sample(seq["sampler"], ctx, b_idx)
+
+                is_eog = bool(llama_cpp.llama_vocab_is_eog(vocab, tok))
+                seq["generated_count"] += 1
+
+                piece = ""
+                if not is_eog:
+                    tok_bytes = model.detokenize([tok])
+                    seq["byte_buf"].extend(tok_bytes)
+                    # Flush valid UTF-8 prefix safely
+                    try:
+                        piece = seq["byte_buf"].decode("utf-8")
+                        seq["byte_buf"].clear()
+                    except UnicodeDecodeError:
+                        for cut in range(len(seq["byte_buf"]) - 1, -1, -1):
+                            try:
+                                piece = seq["byte_buf"][:cut].decode("utf-8")
+                                del seq["byte_buf"][:cut]
+                                break
+                            except UnicodeDecodeError:
+                                continue
+
+                seq["text_buf"] += piece
+                seq["next_token"] = tok
+
+                stop_hit = any(s and s in seq["text_buf"] for s in seq["stops"])
+                max_hit = seq["generated_count"] >= seq["max_tokens"]
+                per_seq_ctx = max(128, self.n_ctx // max(1, self.continuous_batch_slots))
+                ctx_hit = seq["pos"] >= per_seq_ctx - 2
+                finished = is_eog or stop_hit or max_hit or ctx_hit
+
+                if stop_hit:
+                    for s in seq["stops"]:
+                        if s and seq["text_buf"].endswith(s):
+                            seq["text_buf"] = seq["text_buf"][: -len(s)]
+                            piece = ""
+
+                events.append((seq_id, piece, finished, "stop" if (is_eog or stop_hit) else "length"))
+            return events
+        finally:
+            llama_cpp.llama_batch_free(batch)
+
+    def _release_seq_sync(self, model: llama_cpp.Llama, seq_id: int, sampler: Any) -> None:
+        if sampler is not None:
+            llama_cpp.llama_sampler_free(sampler)
+        mem = llama_cpp.llama_get_memory(model.ctx)
+        if mem is not None:
+            llama_cpp.llama_memory_seq_rm(mem, seq_id, -1, -1)
+
     async def _worker(self):
         """
-        Continuous Batching Scheduler.
-        Continuously admits incoming requests from the waiting queue into available execution
-        slots as soon as any slot becomes free, eliminating head-of-line blocking.
+        True Iteration-Level Continuous Batching Scheduler.
+        Uses ONE shared Llama model + unified KV cache (`n_seq_max=continuous_batch_slots`).
+        Admits new requests immediately into freed sequence slots between token steps.
         """
-        logger.info(f"Continuous Batching Scheduler active with {self.continuous_batch_slots} execution slot(s).")
-        while self._running_event.is_set():
-            task = None
-            try:
-                task = await asyncio.wait_for(self.waiting_queue.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                break
-
-            task_id = task["task_id"]
-            future = task["future"]
-
-            if future.cancelled() or future.done():
-                self.waiting_queue.task_done()
-                continue
-
-            # Wait for next available continuous batch slot
-            try:
-                slot_id = await self._available_slots.get()
-            except asyncio.CancelledError:
-                if not future.done():
-                    future.set_exception(asyncio.CancelledError("Service stopping"))
-                self.waiting_queue.task_done()
-                break
-
-            slot_task = asyncio.create_task(self._run_slot(slot_id, task))
-            self._active_slot_tasks[task_id] = slot_task
-
-    async def _run_slot(self, slot_id: int, task: dict):
-        """Execute inference for a single request inside an assigned continuous batch slot."""
-        task_id = task["task_id"]
-        prompt = task["prompt"]
-        future = task["future"]
-        stream = task.get("stream", False)
-        stream_queue = task.get("stream_queue")
-        model_id = task.get("model_id")
-        user_id = task.get("user_id")
+        logger.info(f"True Continuous Batching Scheduler active ({self.continuous_batch_slots} sequence slot(s)).")
+        active_seqs: Dict[int, dict] = {}
+        model: Optional[llama_cpp.Llama] = None
 
         try:
-            model = await self._acquire_slot_model(slot_id)
-        except Exception as e:
-            if not future.done():
-                future.set_exception(e)
-            self.waiting_queue.task_done()
-            await self._available_slots.put(slot_id)
-            return
-
-        try:
-            # Resolve per-request generation parameters with fallbacks
-            repeat_penalty_val = task.get("repeat_penalty")
-            if repeat_penalty_val is None:
-                repeat_penalty_val = self.repeat_penalty if self.repeat_penalty is not None else 1.0
-
-            max_tokens_val = task.get("max_tokens")
-            if max_tokens_val is None:
-                max_tokens_val = self.n_predict
-
-            temp_val = task.get("temperature")
-            if temp_val is None:
-                temp_val = self.temperature
-
-            top_p_val = task.get("top_p")
-            if top_p_val is None:
-                top_p_val = self.top_p
-
-            top_k_val = task.get("top_k")
-            if top_k_val is None:
-                top_k_val = self.top_k
-
-            stop_val = task.get("stop")
-            if stop_val is None:
-                stop_val = self.stops
-
-            cancel_flag = self._stream_cancel_flags.get(task_id)
-
-            if stream:
-                loop = asyncio.get_running_loop()
-
-                def generate():
-                    generator = model(
-                        prompt,
-                        max_tokens=max_tokens_val,
-                        temperature=temp_val,
-                        top_p=top_p_val,
-                        top_k=top_k_val,
-                        stream=True,
-                        stop=stop_val,
-                        repeat_penalty=repeat_penalty_val,
-                    )
+            while self._running_event.is_set():
+                # 1. Admit queued requests into any free sequence slots
+                while not self._available_slots.empty():
+                    if not active_seqs and self.waiting_queue.empty():
+                        break
                     try:
-                        for chunk in generator:
-                            if cancel_flag and cancel_flag.is_set():
-                                logger.info(f"Stream {task_id} aborted mid-generation in slot {slot_id}")
-                                break
-                            token = chunk["choices"][0]["text"]
-                            asyncio.run_coroutine_threadsafe(stream_queue.put(token), loop)
-                    except Exception as e:
-                        asyncio.run_coroutine_threadsafe(stream_queue.put(e), loop)
-                    finally:
-                        asyncio.run_coroutine_threadsafe(stream_queue.put(None), loop)
+                        task = self.waiting_queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+
+                    future = task["future"]
+                    if future.cancelled() or future.done():
+                        self.waiting_queue.task_done()
+                        continue
+
+                    slot_id = await self._available_slots.get()
+                    try:
+                        if model is None:
+                            model = await self._acquire_slot_model(slot_id)
+                        else:
+                            await self._acquire_slot_model(slot_id)
+
+                        prompt_tokens = await asyncio.to_thread(
+                            model.tokenize, task["prompt"].encode("utf-8"), True, True
+                        )
+                        max_tokens_val = int(task.get("max_tokens") or self.n_predict)
+                        per_seq_ctx = max(256, self.n_ctx // max(1, self.continuous_batch_slots))
+                        # Reserve enough room for generation (at least min(max_tokens_val, 512) tokens)
+                        reserve_gen = min(max_tokens_val, max(256, per_seq_ctx // 3))
+                        max_prompt = max(128, per_seq_ctx - reserve_gen)
+                        if len(prompt_tokens) > max_prompt:
+                            # Keep system/header prefix + tail (user question & latest context)
+                            head_keep = min(256, max_prompt // 4)
+                            tail_keep = max_prompt - head_keep
+                            prompt_tokens = prompt_tokens[:head_keep] + prompt_tokens[-tail_keep:]
+                        stops_val = task.get("stop")
+                        stops_val = self.stops if stops_val is None else stops_val
+
+                        active_seqs[slot_id] = {
+                            "task": task,
+                            "prompt_tokens": prompt_tokens,
+                            "prompt_token_count": len(prompt_tokens),
+                            "prefill_idx": 0,
+                            "pos": 0,
+                            "next_token": 0,
+                            "generated_count": 0,
+                            "max_tokens": int(max_tokens_val),
+                            "stops": stops_val or [],
+                            "byte_buf": bytearray(),
+                            "text_buf": "",
+                            "sampler": self._build_sampler(model, task),
+                        }
+                    except Exception as admit_exc:
                         if not future.done():
-                            loop.call_soon_threadsafe(future.set_result, None)
+                            future.set_exception(admit_exc)
+                        if task.get("stream") and task.get("stream_queue"):
+                            await task["stream_queue"].put(admit_exc)
+                            await task["stream_queue"].put(None)
+                        self.waiting_queue.task_done()
+                        await self._available_slots.put(slot_id)
+                        await self._release_model()
 
-                await asyncio.to_thread(generate)
-            else:
-                logger.info(f"[Slot {slot_id}] Processing request {task_id}: {prompt[:50]}...")
+                # 2. If nothing active, wait briefly for next request
+                if not active_seqs:
+                    try:
+                        task = await asyncio.wait_for(self.waiting_queue.get(), timeout=0.5)
+                        # Put back at front? Re-enqueue cleanly via local variable by putting back if needed
+                        # Instead, process directly on next loop by putting into a temporary pending slot
+                        await self.waiting_queue.put(task)
+                        self.waiting_queue.task_done()
+                        continue
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.CancelledError:
+                        break
 
-                raw_response = await asyncio.to_thread(
-                    model,
-                    prompt,
-                    max_tokens=max_tokens_val,
-                    temperature=temp_val,
-                    top_p=top_p_val,
-                    top_k=top_k_val,
-                    stream=False,
-                    stop=stop_val,
-                    repeat_penalty=repeat_penalty_val,
-                )
+                # 3. Check cancellations before stepping
+                for seq_id in list(active_seqs.keys()):
+                    seq = active_seqs[seq_id]
+                    task = seq["task"]
+                    tid = task["task_id"]
+                    cancel_flag = self._stream_cancel_flags.get(tid)
+                    if task["future"].cancelled() or (cancel_flag and cancel_flag.is_set()):
+                        await asyncio.to_thread(self._release_seq_sync, model, seq_id, seq["sampler"])
+                        if task.get("stream") and task.get("stream_queue"):
+                            await task["stream_queue"].put(None)
+                        if not task["future"].done():
+                            task["future"].set_result(None)
+                        active_seqs.pop(seq_id)
+                        self.waiting_queue.task_done()
+                        await self._available_slots.put(seq_id)
+                        await self._release_model()
 
-                if isinstance(raw_response, dict) and "choices" in raw_response:
-                    finish_reason = raw_response["choices"][0].get("finish_reason")
-                    if finish_reason == "length":
-                        logger.warning(f"[Slot {slot_id}] Request {task_id} stopped due to max_tokens limit")
-                    elif finish_reason == "stop":
-                        logger.info(f"[Slot {slot_id}] Request {task_id} stopped by stop token")
+                if not active_seqs:
+                    continue
 
-                if not future.done():
-                    content = self._extract_content(raw_response)
-                    message = AIMessage(content=content, response_metadata={
-                        **raw_response,
-                        "model_id": model_id,
-                        "user_id": user_id,
-                        "task_id": task_id,
-                        "slot_id": slot_id,
-                    })
-                    future.set_result(message)
-                logger.info(f"[Slot {slot_id}] Request {task_id} completed")
-        except Exception as e:
-            logger.error(f"[Slot {slot_id}] Worker error: {e}", exc_info=True)
-            if not future.done():
-                future.set_exception(e)
+                # 4. Run ONE batched GPU/CPU decode step for all active sequences
+                try:
+                    events = await asyncio.to_thread(self._step_continuous_batch_sync, model, active_seqs)
+                except Exception as step_exc:
+                    logger.error(f"Continuous batch step failed: {step_exc}", exc_info=True)
+                    for seq_id in list(active_seqs.keys()):
+                        seq = active_seqs.pop(seq_id)
+                        task = seq["task"]
+                        await asyncio.to_thread(self._release_seq_sync, model, seq_id, seq["sampler"])
+                        if not task["future"].done():
+                            task["future"].set_exception(step_exc)
+                        if task.get("stream") and task.get("stream_queue"):
+                            await task["stream_queue"].put(step_exc)
+                            await task["stream_queue"].put(None)
+                        self.waiting_queue.task_done()
+                        await self._available_slots.put(seq_id)
+                        await self._release_model()
+                    continue
+
+                # 5. Dispatch streamed tokens & retire finished sequences immediately
+                for seq_id, piece, finished, finish_reason in events:
+                    seq = active_seqs.get(seq_id)
+                    if not seq:
+                        continue
+                    task = seq["task"]
+                    if task.get("stream") and task.get("stream_queue") and piece:
+                        await task["stream_queue"].put(piece)
+
+                    if finished:
+                        await asyncio.to_thread(self._release_seq_sync, model, seq_id, seq["sampler"])
+                        active_seqs.pop(seq_id, None)
+                        prompt_cnt = seq["prompt_token_count"]
+                        comp_cnt = seq["generated_count"]
+                        exact_usage = {
+                            "prompt_tokens": prompt_cnt,
+                            "completion_tokens": comp_cnt,
+                            "total_tokens": prompt_cnt + comp_cnt,
+                        }
+                        self._last_usage[task["task_id"]] = exact_usage
+                        if task.get("stream") and task.get("stream_queue"):
+                            await task["stream_queue"].put(None)
+                            if not task["future"].done():
+                                task["future"].set_result(None)
+                        else:
+                            if not task["future"].done():
+                                msg = AIMessage(
+                                    content=seq["text_buf"].strip(),
+                                    response_metadata={
+                                        "finish_reason": finish_reason,
+                                        "task_id": task["task_id"],
+                                        "seq_id": seq_id,
+                                        "generated_tokens": comp_cnt,
+                                        "usage": exact_usage,
+                                    },
+                                )
+                                task["future"].set_result(msg)
+                        self.waiting_queue.task_done()
+                        await self._available_slots.put(seq_id)
+                        await self._release_model()
         finally:
-            await self._release_model()
-            self._active_slot_tasks.pop(task_id, None)
-            self.waiting_queue.task_done()
-            await self._available_slots.put(slot_id)
+            for seq_id, seq in list(active_seqs.items()):
+                if model is not None:
+                    await asyncio.to_thread(self._release_seq_sync, model, seq_id, seq["sampler"])
+                task = seq["task"]
+                if not task["future"].done():
+                    task["future"].set_exception(asyncio.CancelledError("Worker stopped"))
+                if task.get("stream") and task.get("stream_queue"):
+                    await task["stream_queue"].put(None)
+                self.waiting_queue.task_done()
+                await self._available_slots.put(seq_id)
+                await self._release_model()
 
     async def start(self):
         if self._running_event.is_set():
@@ -1267,7 +1499,7 @@ class AsyncLLM:
             "timestamp": time.time(),
             "stream": False,
         }
-        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty", "model_id", "user_id"]
+        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty", "response_format", "model_id", "user_id"]
         for p in allowed_params:
             if p in gen_kwargs and gen_kwargs[p] is not None:
                 task_params[p] = gen_kwargs[p]
@@ -1333,7 +1565,7 @@ class AsyncLLM:
             "stream": True,
             "stream_queue": stream_queue,
         }
-        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty", "model_id", "user_id"]
+        allowed_params = ["temperature", "top_p", "top_k", "max_tokens", "stop", "repeat_penalty", "response_format", "model_id", "user_id"]
         for p in allowed_params:
             if p in gen_kwargs and gen_kwargs[p] is not None:
                 task_params[p] = gen_kwargs[p]

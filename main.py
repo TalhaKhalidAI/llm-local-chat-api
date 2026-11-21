@@ -1,6 +1,8 @@
 from contextlib import asynccontextmanager
+import asyncio
 import os
-from fastapi import FastAPI, status, Request,applications
+from fastapi import FastAPI, HTTPException, status, Request, applications
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -10,6 +12,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from App.api.v1 import v1_router
 from App.core.settings import settings
 from App.core.LoggingInit import get_core_logger
+from App.core.exceptions import AppError
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html
 import fastapi_offline_swagger_ui
@@ -97,6 +100,73 @@ async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
         content={"error": f"Rate limit exceeded: {detail}"}
     )
 
+
+@app.exception_handler(AppError)
+async def app_error_handler(request: Request, exc: AppError):
+    """Centralized handler for all custom AppError exceptions (ModelNotLoadedError, etc.)."""
+    logger.warning(f"[{exc.error_code}] {request.url.path}: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.error_code, "detail": exc.detail},
+    )
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Centralized handler for FastAPI HTTPException."""
+    logger.warning(f"[HTTP_{exc.status_code}] {request.url.path}: {exc.detail}")
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": f"HTTP_{exc.status_code}", "detail": exc.detail},
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    """Centralized handler for request validation errors."""
+    logger.warning(f"[VALIDATION_ERROR] {request.url.path}: {exc.errors()}")
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+        content={"error": "REQUEST_VALIDATION_ERROR", "detail": exc.errors()},
+    )
+
+
+@app.exception_handler(asyncio.QueueFull)
+async def queue_full_handler(request: Request, exc: asyncio.QueueFull):
+    logger.warning(f"[QUEUE_FULL] {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={"error": "QUEUE_FULL", "detail": str(exc) or "Request queue is full"},
+    )
+
+
+@app.exception_handler(FileNotFoundError)
+async def file_not_found_handler(request: Request, exc: FileNotFoundError):
+    logger.warning(f"[FILE_NOT_FOUND] {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={"error": "FILE_NOT_FOUND", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(MemoryError)
+async def memory_error_handler(request: Request, exc: MemoryError):
+    logger.error(f"[INSUFFICIENT_MEMORY] {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_507_INSUFFICIENT_STORAGE,
+        content={"error": "INSUFFICIENT_MEMORY", "detail": str(exc)},
+    )
+
+
+@app.exception_handler(ValueError)
+async def value_error_handler(request: Request, exc: ValueError):
+    logger.warning(f"[VALUE_ERROR] {request.url.path}: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content={"error": "VALIDATION_ERROR", "detail": str(exc)},
+    )
+
 @app.middleware("http")
 async def kill_switch_middleware(request: Request, call_next):
     """Global middleware for emergency kill switch (Maintenance Mode)"""
@@ -124,6 +194,8 @@ async def kill_switch_middleware(request: Request, call_next):
     try:
         response = await call_next(request)
         return response
+    except (AppError, HTTPException, RequestValidationError, asyncio.QueueFull, ValueError, FileNotFoundError, MemoryError):
+        raise
     except Exception as e:
         logger.error(f"CRITICAL: Unhandled exception detected. Triggering AUTO-KILL. Error: {e}")
         app.state.auto_kill_enabled = True

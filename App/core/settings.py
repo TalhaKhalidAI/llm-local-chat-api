@@ -121,17 +121,17 @@ class Settings(BaseSettings):
         description="Max bytes to download per web page"
     )
     ORCH_CHUNK_SIZE_CHARS: int = Field(
-        default=1600,
+        default=900,
         ge=300,
         description="Chunk size in characters for RAG ingestion"
     )
     ORCH_CHUNK_OVERLAP_CHARS: int = Field(
-        default=200,
+        default=120,
         ge=0,
         description="Chunk overlap in characters"
     )
     ORCH_MAX_RAG_CHUNKS: int = Field(
-        default=4,
+        default=3,
         ge=1,
         le=10,
         description="Max retrieved chunks injected into prompt"

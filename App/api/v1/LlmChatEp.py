@@ -1,6 +1,13 @@
 from App.repository.llmRepository import llmChatRepo
 from App.core.orchestrator import ChatOrchestrator
-from fastapi import APIRouter, HTTPException, status, Request, Depends, Query, File, Form, UploadFile
+from App.core.exceptions import (
+    ImageTooLargeError,
+    InvalidCollectionError,
+    InvalidImageError,
+    MissingRequestFieldError,
+    ModelNotLoadedError,
+)
+from fastapi import APIRouter, Request, Depends, Query, File, Form, UploadFile
 from App.models.llmModels import ChatChoice, ChatMessage, ChatRequest, ChatResponse
 from App.core.settings import settings
 from fastapi.responses import StreamingResponse
@@ -8,7 +15,6 @@ from uuid import uuid4
 import asyncio
 import time
 import json
-import traceback
 import logging
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -95,191 +101,265 @@ def split_large_messages(messages, splitter, max_chunk_size: int = 4000) -> str:
     prompt += "[ASSISTANT] "
     return prompt
 
-@llmRouter.post("/chat/completions")
-async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Depends(get_repo)):
+def _inject_tools_into_messages(
+    messages: list[dict],
+    tools: list[dict] | None,
+    tool_choice: str | dict | None,
+) -> list[dict]:
+    """Inject OpenAI tool definitions cleanly if tools are requested and tool_choice != 'none'."""
+    if not tools or tool_choice == "none":
+        return messages
+    tool_defs = json.dumps(tools, indent=2)
+    tool_instruction = (
+        "You have access to the following tools/functions. "
+        "If you decide to call a tool, respond ONLY with a JSON object in this exact format:\n"
+        '{"name": "<tool_name>", "arguments": {<args>}}\n\n'
+        f"Available tools:\n{tool_defs}"
+    )
+    out = [dict(m) for m in messages]
+    if out and out[0].get("role") == "system":
+        out[0]["content"] = f"{out[0]['content']}\n\n{tool_instruction}".strip()
+    else:
+        out.insert(0, {"role": "system", "content": tool_instruction})
+    return out
+
+
+def _extract_tool_calls(content: str, tools: list[dict] | None) -> list[dict] | None:
+    """Parse JSON tool call output into OpenAI `tool_calls` format when valid."""
+    if not tools or not content:
+        return None
+    tool_names = {
+        (t.get("function", {}) if isinstance(t, dict) else {}).get("name") or t.get("name")
+        for t in tools
+    }
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.strip("`").lstrip("json").strip()
     try:
-        logger.info(f"Chat request - Model: {request.model}, Messages: {len(request.messages)}")
-        
-        # ============================================
-        # 1. CHECK IF REPOSITORY IS READY
-        # ============================================
-        if not await repo.is_ready():
-            logger.warning("Repository not ready - attempting to initialize...")
+        obj = json.loads(text)
+    except Exception:
+        return None
+    if isinstance(obj, dict) and obj.get("name") in tool_names:
+        args = obj.get("arguments", obj.get("parameters", {}))
+        return [{
+            "id": f"call_{uuid4().hex[:12]}",
+            "type": "function",
+            "function": {
+                "name": obj["name"],
+                "arguments": args if isinstance(args, str) else json.dumps(args),
+            },
+        }]
+    return None
+
+
+async def _require_loaded_model(repo: llmChatRepo, requested_model: str | None = None) -> str:
+    """Ensure a model is already loaded (never auto-load on chat/vision endpoints)."""
+    is_ready = await repo.is_ready()
+    loaded_models = await repo.get_loaded_models_list()
+    if not is_ready or not loaded_models:
+        raise ModelNotLoadedError("No model is currently loaded. Please load a model first via POST /app/v1/load_model.")
+    active = loaded_models[0]
+    if requested_model and requested_model not in ("string", active):
+        raise ModelNotLoadedError(
+            f"Requested model '{requested_model}' is not loaded (active model: '{active}'). "
+            "Load it first via POST /app/v1/load_model."
+        )
+    return active
+
+
+@llmRouter.post("/chat/completions")
+async def completion(
+    req: Request,
+    request: ChatRequest | None = Form(default=None, description="ChatRequest JSON"),
+    image: UploadFile | None = File(default=None, description="Optional image upload (processed strictly in RAM)"),
+    repo: llmChatRepo = Depends(get_repo),
+):
+    image_bytes: bytes | None = None
+    ctype = req.headers.get("content-type", "").lower()
+
+    if ctype.startswith("application/json"):
+        body = await req.json()
+        request = ChatRequest(**body)
+    else:
+        if request is None:
+            raise MissingRequestFieldError("Missing 'request' JSON form field")
+        if image is not None and image.filename:
+            image_bytes = await image.read()
+            if not image_bytes:
+                raise InvalidImageError("Uploaded image is empty")
+            if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
+                raise ImageTooLargeError("Image exceeds 15MB limit")
+
+    active_model = await _require_loaded_model(repo, request.model)
+    request.model = active_model
+    logger.info(f"Chat request - Model: {request.model}, Messages: {len(request.messages)}, Image: {image_bytes is not None}")
+
+    # ============================================
+    # 1. ORCHESTRATION (RAG + WEB SEARCH + VISION) -> NATIVE TEMPLATE PROMPT
+    # ============================================
+    orch_ctx = None
+    should_orchestrate = settings.ORCH_ENABLED and (
+        getattr(request, "use_orchestrator", True)
+        or getattr(request, "use_web", None) is True
+        or getattr(request, "use_rag", None) is True
+        or image_bytes is not None
+        or getattr(request, "image_base64", None) is not None
+    )
+    if should_orchestrate:
+        orch_ctx = await _orchestrator.prepare_context(
+            request.messages,
+            image_bytes=image_bytes,
+            image_base64=getattr(request, "image_base64", None),
+            force_web=getattr(request, "use_web", None),
+            force_rag=getattr(request, "use_rag", None),
+        )
+        raw_messages = orch_ctx.enriched_messages
+        logger.info(
+            f"🧭 Orchestrator route={orch_ctx.route.model_dump()} | "
+            f"citations={len(orch_ctx.citations)} | metrics={orch_ctx.metrics_ms}"
+        )
+    else:
+        raw_messages = [
+            {
+                "role": m.role,
+                "content": m.content if isinstance(m.content, str) else json.dumps(m.content),
+            }
+            for m in request.messages
+        ]
+
+    if not raw_messages:
+        raw_messages = [{"role": "user", "content": "Hello"}]
+
+    raw_messages = _inject_tools_into_messages(raw_messages, request.tools, request.tool_choice)
+    prompt = await repo.format_messages_native(raw_messages, tools=request.tools)
+
+    logger.info(f"📝 Prompt: {len(prompt)} chars")
+    logger.info(f"📄 Preview: {prompt[:150]}...")
+
+    # ============================================
+    # 2. CALL THE LOADED LLM (NO AUTO-LOAD)
+    # ============================================
+    gen_kwargs = {}
+    if getattr(request, 'temperature', None) is not None:
+        gen_kwargs["temperature"] = request.temperature
+    if getattr(request, 'max_tokens', None) is not None:
+        gen_kwargs["max_tokens"] = request.max_tokens
+    if getattr(request, 'top_p', None) is not None:
+        gen_kwargs["top_p"] = request.top_p
+    if getattr(request, 'top_k', None) is not None:
+        gen_kwargs["top_k"] = request.top_k
+    if getattr(request, 'stop', None) is not None:
+        gen_kwargs["stop"] = request.stop
+    if getattr(request, 'repeat_penalty', None) is not None:
+        gen_kwargs["repeat_penalty"] = request.repeat_penalty
+    if getattr(request, 'response_format', None) is not None:
+        gen_kwargs["response_format"] = request.response_format
+
+    use_stream = request.stream if request.stream is not None else settings.STREAM_RESPONSE
+    if use_stream:
+        response_id = f"chatcmpl-{uuid4().hex[:8]}"
+        stream_task_id = f"strm-{uuid4().hex[:10]}"
+        created = int(time.time())
+        include_usage = bool(request.stream_options and request.stream_options.get("include_usage"))
+
+        async def stream_response():
+            def chunk(delta, finish_reason=None, usage=None):
+                payload = {
+                    "id": response_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": delta,
+                        "finish_reason": finish_reason,
+                    }],
+                }
+                if usage is not None:
+                    payload["usage"] = usage
+                return "data: " + json.dumps(payload) + "\n\n"
+
+            collected: list[str] = []
+            completed_normally = False
+            yield chunk({"role": "assistant"})
             try:
-                await repo.initialize(model_name=request.model)
-                logger.info(f"Repository initialized with model: {request.model}")
-            except Exception as e:
-                logger.error(f"Failed to initialize repository: {e}")
-                return ChatResponse(
-                    id=f"chatcmpl-{uuid4().hex[:8]}",
-                    object="chat.completion",
-                    created=int(time.time()),
-                    model=request.model,
-                    choices=[
-                        ChatChoice(
-                            index=0,
-                            message=ChatMessage(
-                                role="assistant",
-                                content=f"Error: Model '{request.model}' not loaded. Error: {str(e)}"
-                            ),
-                            finish_reason="error"
-                        )
-                    ],
-                    usage={"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
-                )
-        
-        # ============================================
-        # 2. ORCHESTRATION (RAG + WEB SEARCH + VISION) -> BUILD PROMPT
-        # ============================================
-        orch_ctx = None
-        if getattr(request, "use_orchestrator", True) and settings.ORCH_ENABLED:
-            orch_ctx = await _orchestrator.prepare_context(
-                request.messages,
-                image_base64=getattr(request, "image_base64", None),
-                force_web=getattr(request, "use_web", None),
-                force_rag=getattr(request, "use_rag", None),
-            )
-            prompt = split_large_messages(orch_ctx.enriched_messages, text_splitter)
-            logger.info(
-                f"🧭 Orchestrator route={orch_ctx.route.model_dump()} | "
-                f"citations={len(orch_ctx.citations)} | metrics={orch_ctx.metrics_ms}"
-            )
-        else:
-            prompt = split_large_messages(request.messages, text_splitter)
-        
-        if not prompt or prompt == "[ASSISTANT] ":
-            prompt = "[USER] Hello\n[ASSISTANT] "
-        
-        # Log prompt size
-        prompt_chars = len(prompt)
-        prompt_tokens_estimate = prompt_chars // 4
-        logger.info(f"📝 Prompt: {prompt_chars} chars (~{prompt_tokens_estimate} tokens)")
-        logger.info(f"📄 Preview: {prompt[:150]}...")
-
-        # ============================================
-        # 3. CALL THE LLM with safe parameter handling
-        # ============================================
-        # Build kwargs safely from request parameters
-        gen_kwargs = {}
-        if getattr(request, 'temperature', None) is not None:
-            gen_kwargs["temperature"] = request.temperature
-        if getattr(request, 'max_tokens', None) is not None:
-            gen_kwargs["max_tokens"] = request.max_tokens
-        if getattr(request, 'top_p', None) is not None:
-            gen_kwargs["top_p"] = request.top_p
-        if getattr(request, 'top_k', None) is not None:
-            gen_kwargs["top_k"] = request.top_k
-        if getattr(request, 'stop', None) is not None:
-            gen_kwargs["stop"] = request.stop
-        if getattr(request, 'repeat_penalty', None) is not None:
-            gen_kwargs["repeat_penalty"] = request.repeat_penalty
-
-        if request.stream or settings.STREAM_RESPONSE:
-            response_id = f"chatcmpl-{uuid4().hex[:8]}"
-            created = int(time.time())
-
-            async def stream_response():
-                def chunk(delta, finish_reason=None):
-                    return (
-                        "data: "
-                        + json.dumps({
-                            "id": response_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": request.model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": delta,
-                                "finish_reason": finish_reason,
-                            }],
-                        })
-                        + "\n\n"
-                    )
-
-                collected: list[str] = []
-                yield chunk({"role": "assistant"})
                 async with _orchestrator.vram_gate:
-                    if not await repo.is_ready():
-                        await repo.initialize(model_name=request.model)
-                    async for token in repo.stream_llm(prompt, **gen_kwargs):
+                    async for token in repo.stream_llm(prompt, chat_id=stream_task_id, **gen_kwargs):
+                        if await req.is_disconnected():
+                            logger.info(f"Client disconnected mid-stream; cancelling {stream_task_id}")
+                            await repo.cancel_request(stream_task_id)
+                            return
                         collected.append(token)
                         yield chunk({"content": token})
+                completed_normally = True
                 yield chunk({}, finish_reason="stop")
+                if include_usage:
+                    yield chunk({}, finish_reason=None, usage=repo.pop_last_usage(stream_task_id))
+                else:
+                    repo.pop_last_usage(stream_task_id)
                 yield "data: [DONE]\n\n"
-                if orch_ctx is not None:
-                    try:
-                        await _orchestrator.memory.record_chat_turn(
-                            query=orch_ctx.user_query,
-                            answer="".join(collected),
-                            model_used=request.model,
-                            route=orch_ctx.route,
-                        )
-                    except Exception as rec_err:
-                        logger.warning(f"Failed to record streamed chat turn: {rec_err}")
+            finally:
+                if not completed_normally:
+                    await repo.cancel_request(stream_task_id)
+                    repo.pop_last_usage(stream_task_id)
 
-            return StreamingResponse(
-                stream_response(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "X-Accel-Buffering": "no",
-                },
-            )
-        
-        async with _orchestrator.vram_gate:
-            if not await repo.is_ready():
-                await repo.initialize(model_name=request.model)
-            response = await repo.chat(
-                prompt=prompt,
-                **gen_kwargs
-            )
-        
-        content = response if isinstance(response, str) else str(response)
-        if orch_ctx is not None:
-            try:
+            if orch_ctx is not None:
                 await _orchestrator.memory.record_chat_turn(
                     query=orch_ctx.user_query,
-                    answer=content,
+                    answer="".join(collected),
                     model_used=request.model,
                     route=orch_ctx.route,
                 )
-            except Exception as rec_err:
-                logger.warning(f"Failed to record chat turn: {rec_err}")
-        
-        logger.info(f"✅ LLM response received: {content[:100]}...")
-        
-        # Calculate usage
-        completion_tokens = len(content.split())
-        
-        return ChatResponse(
-            id=f"chatcmpl-{uuid4().hex[:8]}",
-            object="chat.completion",
-            created=int(time.time()),
-            model=request.model,
-            choices=[
-                ChatChoice(
-                    index=0,
-                    message=ChatMessage(
-                        role="assistant",
-                        content=content
-                    ),
-                    finish_reason="stop"
-                )
-            ],
-            usage={
-                "prompt_tokens": prompt_tokens_estimate,
-                "completion_tokens": completion_tokens,
-                "total_tokens": prompt_tokens_estimate + completion_tokens
-            }
+
+        return StreamingResponse(
+            stream_response(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "X-Accel-Buffering": "no",
+            },
         )
-        
-    except Exception as e:
-        logger.error(f"Error in chat completion: {e}")
-        logger.error(traceback.format_exc())
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error occurred during chat with LLM: {str(e)}"
+
+    async with _orchestrator.vram_gate:
+        ai_msg = await repo.chat_with_metadata(
+            prompt=prompt,
+            **gen_kwargs
         )
+
+    content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
+    meta = getattr(ai_msg, "response_metadata", {}) or {}
+    exact_usage = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    tool_calls = _extract_tool_calls(content, request.tools)
+    finish_reason = "tool_calls" if tool_calls else meta.get("finish_reason", "stop")
+
+    if orch_ctx is not None:
+        await _orchestrator.memory.record_chat_turn(
+            query=orch_ctx.user_query,
+            answer=content,
+            model_used=request.model,
+            route=orch_ctx.route,
+        )
+
+    logger.info(f"✅ LLM response received: {content[:100]}...")
+
+    return ChatResponse(
+        id=f"chatcmpl-{uuid4().hex[:8]}",
+        object="chat.completion",
+        created=int(time.time()),
+        model=request.model,
+        choices=[
+            ChatChoice(
+                index=0,
+                message=ChatMessage(
+                    role="assistant",
+                    content=None if tool_calls else content,
+                    tool_calls=tool_calls,
+                ),
+                finish_reason=finish_reason,
+            )
+        ],
+        usage=exact_usage,
+    )
 
 
 # @llmRouter.post("/chat/completions")
@@ -402,47 +482,36 @@ async def load_model(model_name: str, repo: llmChatRepo = Depends(get_repo)):
     Load a specific model into the repository.
     If the model is already loaded, just return a message saying so.
     """
-    try:
-        # Check if repository is ready and what models are loaded
-        is_ready = await repo.is_ready()
-        loaded_models = await repo.get_loaded_models_list()
-        
-        # If model is already loaded, return early
-        if is_ready and model_name in loaded_models:
-            logger.info(f"Model '{model_name}' is already loaded")
-            return {
-                "status": "already_loaded",
-                "message": f"Model '{model_name}' is already loaded and ready to use",
-                "model": model_name,
-                "ready": True,
-                "loaded_models": loaded_models
-            }
-        
-        # If a different model is loaded, unload it first
-        if is_ready and loaded_models:
-            current_model = loaded_models[0]
-            logger.info(f"Unloading current model '{current_model}' to load '{model_name}'")
-            await repo.shutdown()
-            logger.info(f"Model '{current_model}' unloaded successfully")
-        
-        # Load the new model
-        logger.info(f"Loading model '{model_name}'...")
-        await repo.initialize(model_name=model_name)
-        
+    is_ready = await repo.is_ready()
+    loaded_models = await repo.get_loaded_models_list()
+
+    if is_ready and model_name in loaded_models:
+        logger.info(f"Model '{model_name}' is already loaded")
         return {
-            "status": "success",
-            "message": f"Model '{model_name}' loaded successfully",
+            "status": "already_loaded",
+            "message": f"Model '{model_name}' is already loaded and ready to use",
             "model": model_name,
-            "ready": await repo.is_ready(),
-            "loaded_models": await repo.get_loaded_models_list()
+            "ready": True,
+            "loaded_models": loaded_models,
         }
-        
-    except Exception as e:
-        logger.error(f"Error loading model: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error loading model: {e}"
-        )
+
+    if is_ready and loaded_models:
+        current_model = loaded_models[0]
+        logger.info(f"Unloading current model '{current_model}' to load '{model_name}'")
+        await repo.shutdown()
+        logger.info(f"Model '{current_model}' unloaded successfully")
+
+    logger.info(f"Loading model '{model_name}'...")
+    await repo.initialize(model_name=model_name)
+
+    return {
+        "status": "success",
+        "message": f"Model '{model_name}' loaded successfully",
+        "model": model_name,
+        "ready": await repo.is_ready(),
+        "loaded_models": await repo.get_loaded_models_list(),
+    }
+
 
 # ============================================
 # UNLOAD MODEL ENDPOINT
@@ -454,43 +523,31 @@ async def unload_model(repo: llmChatRepo = Depends(get_repo)):
     Unload the currently loaded model.
     If no model is loaded, just return a message saying so.
     """
-    try:
-        # Check if any model is loaded
-        is_ready = await repo.is_ready()
-        loaded_models = await repo.get_loaded_models_list()
-        
-        # If no model is loaded, return early
-        if not is_ready or not loaded_models:
-            logger.info("No model is currently loaded")
-            return {
-                "status": "already_unloaded",
-                "message": "ℹ️ No model is currently loaded. Nothing to unload.",
-                "ready": False,
-                "loaded_models": []
-            }
-        
-        # Get the current model name before unloading
-        current_model = loaded_models[0]
-        
-        # Unload the model
-        logger.info(f"Unloading model '{current_model}'...")
-        await repo.shutdown()
-        logger.info(f"Model '{current_model}' unloaded successfully")
-        
+    is_ready = await repo.is_ready()
+    loaded_models = await repo.get_loaded_models_list()
+
+    if not is_ready or not loaded_models:
+        logger.info("No model is currently loaded")
         return {
-            "status": "success",
-            "message": f"✅ Model '{current_model}' unloaded successfully",
-            "unloaded_model": current_model,
-            "ready": await repo.is_ready(),
-            "loaded_models": await repo.get_loaded_models_list()
+            "status": "already_unloaded",
+            "message": "ℹ️ No model is currently loaded. Nothing to unload.",
+            "ready": False,
+            "loaded_models": [],
         }
-        
-    except Exception as e:
-        logger.error(f"Error unloading model: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error unloading model: {e}"
-        )
+
+    current_model = loaded_models[0]
+    logger.info(f"Unloading model '{current_model}'...")
+    await repo.shutdown()
+    logger.info(f"Model '{current_model}' unloaded successfully")
+
+    return {
+        "status": "success",
+        "message": f"✅ Model '{current_model}' unloaded successfully",
+        "unloaded_model": current_model,
+        "ready": await repo.is_ready(),
+        "loaded_models": await repo.get_loaded_models_list(),
+    }
+
 
 # ============================================
 # HEALTH CHECK ENDPOINT
@@ -498,27 +555,16 @@ async def unload_model(repo: llmChatRepo = Depends(get_repo)):
 
 @llmRouter.get("/health")
 async def health_check(repo: llmChatRepo = Depends(get_repo)):
-    """
-    Check if the LLM service is ready.
-    """
-    try:
-        is_ready = await repo.is_ready()
-        loaded_models = await repo.get_loaded_models_list()
-        
-        return {
-            "status": "healthy" if is_ready else "unhealthy",
-            "ready": is_ready,
-            "models_loaded": len(loaded_models),
-            "loaded_models": loaded_models,
-            "message": "LLM service is ready" if is_ready else "No model loaded. Call /load_model first."
-        }
-    except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return {
-            "status": "error",
-            "ready": False,
-            "error": str(e)
-        }
+    """Check if the LLM service is ready."""
+    is_ready = await repo.is_ready()
+    loaded_models = await repo.get_loaded_models_list()
+    return {
+        "status": "healthy" if is_ready else "unhealthy",
+        "ready": is_ready,
+        "models_loaded": len(loaded_models),
+        "loaded_models": loaded_models,
+        "message": "LLM service is ready" if is_ready else "No model loaded. Call /load_model first.",
+    }
 
 
 # ============================================
@@ -527,30 +573,21 @@ async def health_check(repo: llmChatRepo = Depends(get_repo)):
 
 @llmRouter.get("/models")
 async def get_dir_models(repo: llmChatRepo = Depends(get_repo)):
-    """
-    Get list of available models from the directory.
-    """
-    try:
-        models = await repo.get_models_cdir()
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": model["filename"],
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "local",
-                    "path": model["path"]
-                }
-                for model in models
-            ]
-        }
-    except Exception as e:
-        logger.error(f"Error loading models: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error loading models: {e}"
-        )
+    """Get list of available models from the directory."""
+    models = await repo.get_models_cdir()
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": model["filename"],
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "local",
+                "path": model["path"],
+            }
+            for model in models
+        ],
+    }
 
 
 # ============================================
@@ -590,13 +627,7 @@ async def view_vector_history(
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
     """View stored records from the local ChromaDB vector store."""
-    try:
-        return await orch.memory.list_entries(collection_name=collection, limit=limit, offset=offset)
-    except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
-    except Exception as e:
-        logger.error(f"Error reading vector history: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    return await orch.memory.list_entries(collection_name=collection, limit=limit, offset=offset)
 
 
 @llmRouter.get("/history/search")
@@ -608,16 +639,11 @@ async def search_vector_history(
 ):
     """Semantic search across ChromaDB history (chat turns, cached web pages, indexed images, docs)."""
     if collection not in orch.memory.VALID_COLLECTIONS:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid collection '{collection}'. Choose from {orch.memory.VALID_COLLECTIONS}",
+        raise InvalidCollectionError(
+            f"Invalid collection '{collection}'. Choose from {orch.memory.VALID_COLLECTIONS}"
         )
-    try:
-        hits = await orch.memory.query(collection_name=collection, query=q, n_results=n_results)
-        return {"query": q, "collection": collection, "count": len(hits), "results": hits}
-    except Exception as e:
-        logger.error(f"Error searching vector history: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    hits = await orch.memory.query(collection_name=collection, query=q, n_results=n_results)
+    return {"query": q, "collection": collection, "count": len(hits), "results": hits}
 
 
 # ============================================
@@ -632,20 +658,16 @@ async def test_web_search(
 ):
     """Test DuckDuckGo web search, safe scraping, and ChromaDB ingestion."""
     t0 = time.perf_counter()
-    try:
-        results = await orch.web_tool.search_and_ingest(q, bypass_cache=bypass_cache)
-        elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
-        return {
-            "status": "ok" if results else "no_results",
-            "query": q,
-            "bypass_cache": bypass_cache,
-            "elapsed_ms": elapsed_ms,
-            "count": len(results),
-            "results": results,
-        }
-    except Exception as e:
-        logger.error(f"Web search test failed: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    results = await orch.web_tool.search_and_ingest(q, bypass_cache=bypass_cache)
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+    return {
+        "status": "ok" if results else "no_results",
+        "query": q,
+        "bypass_cache": bypass_cache,
+        "elapsed_ms": elapsed_ms,
+        "count": len(results),
+        "results": results,
+    }
 
 
 # ============================================
@@ -659,25 +681,19 @@ MAX_IMAGE_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB RAM guard
 async def describe_uploaded_image(
     image: UploadFile = File(..., description="Image file processed strictly in RAM"),
     prompt: str = Form(default="", description="Optional question or focus hint for Qwen2-VL"),
+    repo: llmChatRepo = Depends(get_repo),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
-    """Upload an image -> decode in RAM with Qwen2-VL-2B -> index in ChromaDB (never saved to disk)."""
+    """Upload an image -> decode in RAM with Qwen2-VL-2B -> index in ChromaDB (requires loaded model)."""
+    await _require_loaded_model(repo)
     image_bytes = await image.read()
     if not image_bytes:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded image is empty")
+        raise InvalidImageError("Uploaded image is empty")
     if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
-        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image exceeds 15MB limit")
+        raise ImageTooLargeError("Image exceeds 15MB limit")
 
-    try:
-        report = await orch.vision_tool.describe_and_index(image_bytes=image_bytes, user_hint=prompt)
-        return {"status": "ok", "vision_report": report.model_dump()}
-    except asyncio.QueueFull as qf:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(qf))
-    except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
-    except Exception as e:
-        logger.error(f"Vision describe failed: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    report = await orch.vision_tool.describe_and_index(image_bytes=image_bytes, user_hint=prompt)
+    return {"status": "ok", "vision_report": report.model_dump()}
 
 
 @llmRouter.post("/chat/completions/upload")
@@ -692,50 +708,42 @@ async def chat_with_uploaded_image(
     repo: llmChatRepo = Depends(get_repo),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
-    """Chat with optional uploaded image + prompt -> Qwen2-VL in RAM -> RAG/Web -> active AsyncLLM completion."""
+    """Chat with optional uploaded image + prompt (never auto-loads model; raises ModelNotLoadedError if unloaded)."""
+    active_model = await _require_loaded_model(repo, model)
+
     image_bytes: bytes | None = None
     if image is not None and image.filename:
         image_bytes = await image.read()
         if not image_bytes:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded image is empty")
+            raise InvalidImageError("Uploaded image is empty")
         if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
-            raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="Image exceeds 15MB limit")
+            raise ImageTooLargeError("Image exceeds 15MB limit")
 
-    try:
-        orch_ctx = await orch.prepare_context(
-            [{"role": "user", "content": prompt}],
-            image_bytes=image_bytes,
-            force_web=use_web,
-            force_rag=use_rag,
-        )
-        formatted_prompt = split_large_messages(orch_ctx.enriched_messages, text_splitter)
-        gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
-        async with orch.vram_gate:
-            if not await repo.is_ready():
-                await repo.initialize(model_name=model)
-            response = await repo.chat(prompt=formatted_prompt, **gen_kwargs)
-        content = response if isinstance(response, str) else str(response)
+    orch_ctx = await orch.prepare_context(
+        [{"role": "user", "content": prompt}],
+        image_bytes=image_bytes,
+        force_web=use_web,
+        force_rag=use_rag,
+    )
+    formatted_prompt = await repo.format_messages_native(orch_ctx.enriched_messages)
+    gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
+    async with orch.vram_gate:
+        response = await repo.chat(prompt=formatted_prompt, **gen_kwargs)
+    content = response if isinstance(response, str) else str(response)
 
-        await orch.memory.record_chat_turn(
-            query=orch_ctx.user_query,
-            answer=content,
-            model_used=model,
-            route=orch_ctx.route,
-        )
-        return {
-            "id": f"chatcmpl-{uuid4().hex[:8]}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-            "vision_report": orch_ctx.vision_report.model_dump() if orch_ctx.vision_report else None,
-            "citations": [c.model_dump() for c in orch_ctx.citations],
-            "metrics_ms": orch_ctx.metrics_ms,
-        }
-    except asyncio.QueueFull as qf:
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(qf))
-    except ValueError as ve:
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(ve))
-    except Exception as e:
-        logger.error(f"Error in upload chat completion: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+    await orch.memory.record_chat_turn(
+        query=orch_ctx.user_query,
+        answer=content,
+        model_used=active_model,
+        route=orch_ctx.route,
+    )
+    return {
+        "id": f"chatcmpl-{uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": active_model,
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "vision_report": orch_ctx.vision_report.model_dump() if orch_ctx.vision_report else None,
+        "citations": [c.model_dump() for c in orch_ctx.citations],
+        "metrics_ms": orch_ctx.metrics_ms,
+    }
