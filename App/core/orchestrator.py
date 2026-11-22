@@ -3076,6 +3076,20 @@ class ChatOrchestrator:
                 f"Summary: {vision_report.summary}\n"
                 "</vision_analysis>"
             )
+            # Detect if the image contains programming code, scripts, or terminal output
+            is_code_image = bool(
+                vision_report.scene.lower() == "code"
+                or any(t.lower() in ("code", "coding", "python", "programming", "javascript", "sql", "c++", "rust", "java", "script") for t in vision_report.tags)
+                or any(kw in vision_report.visible_text for kw in ("def ", "import ", "class ", "function", "return ", "var ", "let ", "const ", "print(", "#include", "public ", "fn ", "void ", "=>", "()"))
+            )
+            if (is_code_image or len(vision_report.visible_text.strip()) > 10) and vision_report.visible_text.strip():
+                blocks.append(
+                    "<extracted_code_from_image>\n"
+                    f"// [SOURCE: User uploaded code image / screenshot transcribed via Vision OCR]\n"
+                    f"// Summary: {vision_report.summary}\n\n"
+                    f"{vision_report.visible_text.strip()}\n"
+                    "</extracted_code_from_image>"
+                )
 
         idx = 1
         # 3-Mode Intelligent Document Context Assembly
@@ -3187,11 +3201,19 @@ class ChatOrchestrator:
         if blocks:
             context_str = "<context>\n" + "\n\n".join(blocks) + "\n</context>"
             sys_addition = (
-                "You HAVE live retrieved web pages, scraped URLs, uploaded documents, and/or <conversation_memory> (past chat turns from this user's session) inside <context>. "
+                "You HAVE live retrieved web pages, scraped URLs, uploaded documents, vision OCR analysis, and/or <conversation_memory> inside <context>. "
                 "Use <conversation_memory> to remember facts the user previously told you (such as their name, preferences, or earlier questions). "
                 "Answer directly and thoroughly using the facts, tables, pages, memory, and exact URLs provided in <context> and cite [1], [2] when referencing web/document sources. "
                 "Do NOT say you cannot remember previous interactions, cannot read files, cannot scrape websites, or lack internet access."
             )
+            if vision_report:
+                sys_addition += (
+                    "\n\n[CRITICAL DIRECTIVE - USER IMAGE & CODE ANALYSIS]:\n"
+                    "The user provided an image/screenshot. Our multimodal Vision OCR engine has ALREADY inspected this image and transcribed its objects, visual scene, and text/code into the <extracted_code_from_image> and <vision_analysis> blocks above. "
+                    "You have the exact code and visual information available right in front of you. "
+                    "You MUST NOT refuse by saying 'I cannot view images' or 'I am a text-based model'. "
+                    "Answer the user's question, analyze the code/text thoroughly, explain all bugs or errors found, and provide corrected code solutions."
+                )
             if enriched and enriched[0].get("role") == "system":
                 enriched[0]["content"] = f"{enriched[0]['content']}\n\n{sys_addition}".strip()
             else:
@@ -3199,7 +3221,15 @@ class ChatOrchestrator:
 
             for i in range(len(enriched) - 1, -1, -1):
                 if enriched[i].get("role") == "user":
-                    enriched[i]["content"] = f"{context_str}\n\nUser Question: {enriched[i]['content']}"
+                    user_q_text = enriched[i]["content"]
+                    if vision_report:
+                        enriched[i]["content"] = (
+                            f"{context_str}\n\n"
+                            f"User Question: {user_q_text}\n"
+                            f"(Note for Assistant: The user's uploaded image/code has been pre-transcribed into <extracted_code_from_image> and <vision_analysis> above. Inspect it and answer directly.)"
+                        )
+                    else:
+                        enriched[i]["content"] = f"{context_str}\n\nUser Question: {user_q_text}"
                     break
 
         return OrchestrationContext(

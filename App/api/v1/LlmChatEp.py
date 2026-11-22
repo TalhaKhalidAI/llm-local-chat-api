@@ -994,6 +994,8 @@ async def chat_with_uploaded_code(
     t0 = time.perf_counter()
     ast_report: dict | None = None
     code_context_block = ""
+    vision_report_obj = None
+    is_image_code = False
 
     # Calculate safe token-saving character budget based on active model's per-sequence KV context window
     per_seq_ctx = max(512, repo.n_ctx // max(1, repo.continuous_batch_slots))
@@ -1006,6 +1008,26 @@ async def chat_with_uploaded_code(
             raise InvalidFileError("Uploaded code file is empty")
         if len(code_bytes) > MAX_IMAGE_UPLOAD_BYTES:
             raise FileTooLargeError("Uploaded code file exceeds 15MB limit")
+
+        # Auto-detect if user uploaded an image / screenshot of code instead of raw text
+        fname_lower = code_file.filename.lower()
+        if (
+            fname_lower.endswith((".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".tiff"))
+            or (code_file.content_type and code_file.content_type.startswith("image/"))
+            or code_bytes[:8].startswith((b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF"))
+        ):
+            is_image_code = True
+            logger.info(f"Code endpoint detected image file '{code_file.filename}'. Running In-RAM Vision OCR...")
+            vision_report_obj = await orch.vision_tool.describe(
+                image_bytes=code_bytes,
+                user_hint=f"Extract and transcribe all code, functions, and text accurately from this image. {prompt}",
+                user_id=uid,
+                session_id=sid,
+            )
+            extracted_code = vision_report_obj.visible_text.strip()
+            if not extracted_code or len(extracted_code) < 5:
+                extracted_code = f"// Code extracted from {code_file.filename}\n// Summary: {vision_report_obj.summary}"
+            code_bytes = extracted_code.encode("utf-8")
 
         ast_report = await asyncio.to_thread(
             UniversalCodeASTProcessor.process_code_in_ram,
@@ -1044,6 +1066,14 @@ async def chat_with_uploaded_code(
         await orch.memory.index_parsed_document(doc_rep)
 
     sys_chain = _parse_system_prompts_chain(system_prompts)
+    if is_image_code:
+        sys_chain.insert(0, {
+            "content": (
+                "The user uploaded an image/screenshot of code. It has ALREADY been transcribed into source code text via Vision OCR in the code context block. "
+                "You have full access to the code. You MUST analyze this code, identify and explain all bugs/errors, and provide the corrected code. "
+                "DO NOT claim 'I cannot view images' or 'I am a text-based model'."
+            )
+        })
     messages_chain: list[dict[str, str]] = []
     if sys_chain:
         combined_sys = "\n\n".join(
@@ -1103,6 +1133,7 @@ async def chat_with_uploaded_code(
             }
         ],
         "usage": exact_usage,
+        "vision_report": vision_report_obj.model_dump() if vision_report_obj else None,
         "ast_report": (
             {
                 "filename": ast_report["filename"],
