@@ -312,6 +312,7 @@ async def completion(
             force_rag=getattr(request, "use_rag", None),
             user_id=tenant_user_id,
             session_id=tenant_session_id,
+            model_name=active_model,
         )
         raw_messages = orch_ctx.enriched_messages
         logger.info(
@@ -320,13 +321,24 @@ async def completion(
             f"citations={len(orch_ctx.citations)} | metrics={orch_ctx.metrics_ms}"
         )
     else:
-        raw_messages = [
+        from App.core.orchestrator import get_model_base_prompt
+        base_persona = get_model_base_prompt(active_model)
+        user_sys = [
+            m.content for m in request.messages
+            if m.role == "system" and isinstance(m.content, str) and m.content.strip()
+        ]
+        non_sys = [
             {
                 "role": m.role,
                 "content": m.content if isinstance(m.content, str) else json.dumps(m.content),
             }
             for m in request.messages
+            if m.role != "system"
         ]
+        sys_body = base_persona
+        if user_sys:
+            sys_body += "\n\n[User Custom Instructions]:\n" + "\n\n".join(f"- {s}" for s in user_sys)
+        raw_messages = [{"role": "system", "content": sys_body}] + non_sys
 
     if not raw_messages:
         raw_messages = [{"role": "user", "content": "Hello"}]
@@ -923,6 +935,7 @@ async def chat_with_uploaded_image(
         force_rag=use_rag,
         user_id=uid,
         session_id=sid,
+        model_name=active_model,
     )
     formatted_prompt = await repo.format_messages_native(orch_ctx.enriched_messages)
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
@@ -1097,6 +1110,7 @@ async def chat_with_uploaded_code(
         force_rag=bool(use_rag and code_file is None),
         user_id=uid,
         session_id=sid,
+        model_name=active_model,
     )
     formatted_prompt = await repo.format_messages_native(orch_ctx.enriched_messages)
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}

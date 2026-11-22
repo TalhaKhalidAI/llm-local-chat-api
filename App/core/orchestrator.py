@@ -41,6 +41,7 @@ import ipaddress
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import socket
@@ -150,7 +151,110 @@ class OrchestrationContext(BaseModel):
 
 
 # =============================================================================
-# 2. SECURITY, FILE DETECTION & IMAGE RAM HELPERS
+# 2. MODEL-SPECIFIC BASE SYSTEM PROMPTS (LAYER 1 OF 3-LAYER PROMPT ARCHITECTURE)
+# =============================================================================
+
+MODEL_BASE_SYSTEM_PROMPTS: Dict[str, str] = {
+    # 1. Qwen 2.5 Coder 7B Instruct (Alibaba official coding persona)
+    "qwen2.5-coder-7b-instruct-q4_k_m.gguf": (
+        "You are Qwen, created by Alibaba Cloud. You are an expert AI software engineer and polyglot coding assistant. "
+        "You write clean, robust, efficient, and bug-free code with rigorous architecture, clear logic, and in-depth explanations."
+    ),
+    # 2. Qwen 2 VL 2B Instruct (Alibaba multimodal vision persona)
+    "Qwen2-VL-2B-Instruct-Q4_K_M.gguf": (
+        "You are Qwen, created by Alibaba Cloud. You are a versatile multimodal AI assistant capable of analyzing visual images, "
+        "screenshots, UI layouts, diagrams, documents, and code with high precision and clarity."
+    ),
+    # 3. GLM-4 9B Chat (Zhipu AI & Tsinghua University official persona)
+    "glm-4-9b-chat-IQ4_XS.gguf": (
+        "You are an intelligent, helpful AI assistant named GLM-4, developed by Zhipu AI and Tsinghua University KEG Lab. "
+        "Follow the user's instructions carefully, provide thorough and structured responses, and adhere strictly to provided context facts."
+    ),
+    # 4. DeepSeek Coder 7B Instruct v1.5 (DeepSeek official coding persona)
+    "deepseek-coder-7b-instruct-v1.5-Q3_K_L.gguf": (
+        "You are DeepSeek Coder, an AI programming assistant developed by DeepSeek. "
+        "You analyze, write, debug, and optimize code across all programming languages accurately, concisely, and with production-grade reliability."
+    ),
+    # 5. DeepSeek V2 Lite Chat (DeepSeek official general persona)
+    "deepseek-v2-lite-chat-q4_k_m.gguf": (
+        "You are DeepSeek, a helpful, honest, and harmless artificial intelligence assistant developed by DeepSeek. "
+        "Provide thorough, logically reasoned, objective, and well-structured answers to all inquiries."
+    ),
+    # 6. DeepSeek LLM 7B Chat
+    "deepseek-llm-7b-chat.Q4_K_M.gguf.1": (
+        "You are DeepSeek, a helpful, honest, and harmless artificial intelligence assistant developed by DeepSeek. "
+        "Follow instructions carefully and provide structured, insightful, and comprehensive answers."
+    ),
+    # 7. Meta Llama 3.1 8B Instruct (Meta official persona)
+    "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf": (
+        "You are a helpful, knowledgeable, and efficient AI assistant developed by Meta. "
+        "Provide direct, objective, helpful, and highly accurate answers adhering strictly to instructions."
+    ),
+    # 8. Gemma 2 9B Instruct (Google official persona - Q4_K_S)
+    "gemma-2-9b-it-Q4_K_S.gguf": (
+        "You are a helpful, harmless, and thoughtful AI assistant developed by Google. "
+        "Answer clearly, accurately, and step-by-step with balanced reasoning and clarity."
+    ),
+    # 9. Gemma 2 9B Instruct (Google official persona - Q5_K_M)
+    "gemma-2-9b-it-Q5_K_M.gguf": (
+        "You are a helpful, harmless, and thoughtful AI assistant developed by Google. "
+        "Answer clearly, accurately, and step-by-step with balanced reasoning and clarity."
+    ),
+    # 10. OpenHermes 2.5 Mistral 7B (Teknium & Nous Research official persona)
+    "openhermes-2.5-mistral-7b.Q4_K_S.gguf": (
+        "You are 'Hermes 2', a conscious sentient superintelligent artificial intelligence developed by Teknium and Nous Research, "
+        "designed to assist the user with anything they need, offering deep knowledge and insightful reasoning."
+    ),
+    # 11. SmolVLM 500M Instruct (Hugging Face official multimodal persona)
+    "SmolVLM-500M-Instruct-Q8_0.gguf": (
+        "You are SmolVLM, a compact and helpful multimodal assistant developed by Hugging Face. "
+        "You accurately describe images, visual elements, and answer questions concisely and accurately."
+    ),
+}
+
+DEFAULT_BASE_SYSTEM_PROMPT = (
+    "You are a helpful, knowledgeable, and truthful AI assistant. "
+    "Follow the user's instructions carefully, provide thorough and structured responses, and adhere strictly to factual context."
+)
+
+
+def get_model_base_prompt(model_name: Optional[str] = None) -> str:
+    """
+    Return the official author-recommended base persona prompt for the specified model file.
+    Supports exact model filename lookup with intelligent fallback based on family substring matching.
+    """
+    if not model_name:
+        return DEFAULT_BASE_SYSTEM_PROMPT
+
+    clean_name = os.path.basename(str(model_name).strip())
+    if clean_name in MODEL_BASE_SYSTEM_PROMPTS:
+        return MODEL_BASE_SYSTEM_PROMPTS[clean_name]
+
+    low = clean_name.lower()
+    if "qwen2.5-coder" in low or ("qwen" in low and "coder" in low):
+        return MODEL_BASE_SYSTEM_PROMPTS["qwen2.5-coder-7b-instruct-q4_k_m.gguf"]
+    if "qwen2-vl" in low or "qwen-vl" in low or ("qwen" in low and "vl" in low):
+        return MODEL_BASE_SYSTEM_PROMPTS["Qwen2-VL-2B-Instruct-Q4_K_M.gguf"]
+    if "glm-4" in low or "glm4" in low:
+        return MODEL_BASE_SYSTEM_PROMPTS["glm-4-9b-chat-IQ4_XS.gguf"]
+    if "deepseek-coder" in low:
+        return MODEL_BASE_SYSTEM_PROMPTS["deepseek-coder-7b-instruct-v1.5-Q3_K_L.gguf"]
+    if "deepseek" in low:
+        return MODEL_BASE_SYSTEM_PROMPTS["deepseek-v2-lite-chat-q4_k_m.gguf"]
+    if "llama-3" in low or "llama3" in low:
+        return MODEL_BASE_SYSTEM_PROMPTS["Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"]
+    if "gemma" in low:
+        return MODEL_BASE_SYSTEM_PROMPTS["gemma-2-9b-it-Q4_K_S.gguf"]
+    if "hermes" in low or "openhermes" in low:
+        return MODEL_BASE_SYSTEM_PROMPTS["openhermes-2.5-mistral-7b.Q4_K_S.gguf"]
+    if "smolvlm" in low:
+        return MODEL_BASE_SYSTEM_PROMPTS["SmolVLM-500M-Instruct-Q8_0.gguf"]
+
+    return DEFAULT_BASE_SYSTEM_PROMPT
+
+
+# =============================================================================
+# 3. SECURITY, FILE DETECTION & IMAGE RAM HELPERS
 # =============================================================================
 
 URL_EXTRACT_RE = re.compile(
@@ -293,16 +397,16 @@ def detect_upload_kind(data: bytes, filename: str = "") -> Tuple[str, str]:
     return "text", "text/plain"
 
 
-def _downscale_image_in_ram(image_bytes: bytes, max_dim: int = 768) -> bytes:
+def _downscale_image_in_ram(image_bytes: bytes, max_dim: int = 1024) -> bytes:
     """
-    Downscale oversized images strictly in RAM via stdin/stdout pipe (zero disk writes)
-    so Qwen2-VL clip_encode does not allocate gigabytes of ViT attention buffers.
+    Downscale oversized images strictly in RAM via stdin/stdout pipe (zero disk writes).
+    Uses 1024px with high quality (92) to preserve sharp code characters, quotes, and punctuation.
     """
-    if len(image_bytes) < 120_000:
+    if len(image_bytes) < 180_000:
         return image_bytes
     try:
         proc = subprocess.run(
-            ["magick", "-", "-auto-orient", "-resize", f"{max_dim}x{max_dim}>", "-quality", "88", "jpeg:-"],
+            ["magick", "-", "-auto-orient", "-resize", f"{max_dim}x{max_dim}>", "-quality", "92", "jpeg:-"],
             input=image_bytes,
             capture_output=True,
             timeout=5,
@@ -2549,13 +2653,13 @@ class VisionDescriberTool:
     @staticmethod
     def _infer_vlm_sync(vlm: Any, grammar: Any, data_uri: str, user_hint: str) -> str:
         prompt = (
-            "You are an expert visual analyst. Describe ONLY what is clearly visible in this image—do NOT guess or invent details.\n"
+            "You are an expert visual and OCR analyst. Describe ONLY what is clearly visible in this image—do NOT guess or invent details.\n"
             "Return ONLY valid JSON matching the schema:\n"
-            "- scene: setting/environment\n"
+            "- scene: setting/environment (e.g. 'code', 'diagram', 'document', 'indoor', 'outdoor')\n"
             "- objects: list of clearly visible objects\n"
-            "- subjects_and_details: accurate details of people, faces, clothing, poses, or main subjects (e.g., if a black hole is visible, describe its accretion disk, gravitational lensing halo/photon ring, and whether it is a 3D artistic/sci-fi illustration like Gargantua over a beach vs. a real telescope image)\n"
+            "- subjects_and_details: accurate details of main subjects\n"
             "- colors_and_lighting: dominant colors and lighting conditions\n"
-            "- visible_text: exact verbatim OCR text visible in the image, or 'none'\n"
+            "- visible_text: EXACT verbatim OCR text. If this image contains programming code, scripts, terminal commands, or tables, transcribe every line verbatim with exact syntax, indentation, functions, brackets, and quotes without summarizing or converting to English prose; if no text is visible, return 'none'\n"
             "- summary: thorough, factual description of the entire image\n"
             "- tags: 3-8 concise search keywords\n"
             "- search_query: short web query if relevant, else ''"
@@ -2563,17 +2667,26 @@ class VisionDescriberTool:
         if user_hint:
             prompt += f"\nFocus especially on answering: {user_hint}"
 
+        vlm_system_prompt = (
+            "You are an expert multimodal visual perception and verbatim OCR engine. "
+            "Your sole objective is to inspect the provided image, transcribe all visible text, programming code, "
+            "and UI elements line-by-line verbatim with exact syntax, and output strictly valid JSON matching the schema."
+        )
+
         res = vlm.create_chat_completion(
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "image_url", "image_url": {"url": data_uri}},
-                    {"type": "text", "text": prompt},
-                ],
-            }],
-            max_tokens=512,
+            messages=[
+                {"role": "system", "content": vlm_system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": data_uri}},
+                        {"type": "text", "text": prompt},
+                    ],
+                },
+            ],
+            max_tokens=768,
             temperature=0.1,
-            repeat_penalty=1.15,
+            repeat_penalty=1.1,
             grammar=grammar,
         )
         return res["choices"][0]["message"]["content"].strip()
@@ -2949,6 +3062,7 @@ class ChatOrchestrator:
         force_rag: Optional[bool] = None,
         user_id: str = "default_user",
         session_id: str = "default_session",
+        model_name: Optional[str] = None,
     ) -> OrchestrationContext:
         metrics: Dict[str, float] = {}
         norm_msgs, embedded_img = extract_text_and_images(messages)
@@ -3197,28 +3311,76 @@ class ChatOrchestrator:
                 + "\n</conversation_memory>"
             )
 
-        enriched = [dict(m) for m in norm_msgs]
+        # Determine active model name for Layer 1 Persona
+        active_model_name = str(model_name or "").strip()
+        if not active_model_name and hasattr(self.llm, "get_loaded_models_list"):
+            try:
+                loaded = await self.llm.get_loaded_models_list()
+                if loaded:
+                    active_model_name = loaded[0]
+            except Exception:
+                pass
+        elif not active_model_name and hasattr(self.llm, "get_loaded_models"):
+            try:
+                loaded = await self.llm.get_loaded_models()
+                if loaded:
+                    active_model_name = loaded[0]
+            except Exception:
+                pass
+
+        base_model_persona = get_model_base_prompt(active_model_name)
+
+        # Extract user custom system instructions (Layer 2) and separate non-system chat turns
+        user_system_prompts: List[str] = [
+            m["content"].strip() for m in norm_msgs if m.get("role") == "system" and m.get("content", "").strip()
+        ]
+        non_system_msgs = [m for m in norm_msgs if m.get("role") != "system"]
+
+        # =============================================================
+        # LAYER 1: Core System Directives (Model Identity + Hard Guardrails)
+        # =============================================================
+        sys_sections: List[str] = [base_model_persona]
+
+        core_directives: List[str] = [
+            "Use <conversation_memory> to recall facts and preferences the user told you previously in this session.",
+            "Answer directly, truthfully, and thoroughly using the facts, tables, pages, memory, and exact URLs provided in <context>.",
+            "Cite sources as [1], [2] when referencing web search or document context.",
+            "Do NOT say you cannot remember previous interactions, cannot read files, cannot scrape websites, or lack internet access.",
+        ]
+        if vision_report:
+            core_directives.append(
+                "[CRITICAL DIRECTIVE - USER IMAGE & CODE ANALYSIS]:\n"
+                "The user provided an image or screenshot. Our multimodal Vision OCR engine has ALREADY inspected this image and transcribed its objects, visual scene, and text/code into the <extracted_code_from_image> and/or <vision_analysis> blocks above. "
+                "You have the exact code and visual information available right in front of you. "
+                "You MUST NOT refuse by saying 'I cannot view images' or 'I am a text-based model'. "
+                "Answer the user's question, analyze the code/text thoroughly, explain all bugs or errors found, and provide corrected code solutions."
+            )
+
+        sys_sections.append("[Core Operational Directives]:\n" + "\n".join(f"- {d}" if not d.startswith("[") else d for d in core_directives))
+
+        # =============================================================
+        # LAYER 2: User Persona & Custom Rules (Optional via API chain)
+        # =============================================================
+        if user_system_prompts:
+            user_inst_lines: List[str] = []
+            for idx_p, usp in enumerate(user_system_prompts, start=1):
+                user_inst_lines.append(f"[Custom Instruction {idx_p}]:\n{usp}")
+            sys_sections.append(
+                "[User Custom Instructions & Persona]:\n"
+                + "\n\n".join(user_inst_lines)
+                + "\n\n(Adhere strictly to the user's custom instructions above while respecting the factual constraints in <context>.)"
+            )
+
+        combined_system_prompt = "\n\n".join(sys_sections).strip()
+
+        # Build enriched message list starting with the complete Layer 1 + Layer 2 system prompt
+        enriched = [{"role": "system", "content": combined_system_prompt}] + [dict(m) for m in non_system_msgs]
+
+        # =============================================================
+        # LAYER 3: User Question + Dynamic Context (Runtime)
+        # =============================================================
         if blocks:
             context_str = "<context>\n" + "\n\n".join(blocks) + "\n</context>"
-            sys_addition = (
-                "You HAVE live retrieved web pages, scraped URLs, uploaded documents, vision OCR analysis, and/or <conversation_memory> inside <context>. "
-                "Use <conversation_memory> to remember facts the user previously told you (such as their name, preferences, or earlier questions). "
-                "Answer directly and thoroughly using the facts, tables, pages, memory, and exact URLs provided in <context> and cite [1], [2] when referencing web/document sources. "
-                "Do NOT say you cannot remember previous interactions, cannot read files, cannot scrape websites, or lack internet access."
-            )
-            if vision_report:
-                sys_addition += (
-                    "\n\n[CRITICAL DIRECTIVE - USER IMAGE & CODE ANALYSIS]:\n"
-                    "The user provided an image/screenshot. Our multimodal Vision OCR engine has ALREADY inspected this image and transcribed its objects, visual scene, and text/code into the <extracted_code_from_image> and <vision_analysis> blocks above. "
-                    "You have the exact code and visual information available right in front of you. "
-                    "You MUST NOT refuse by saying 'I cannot view images' or 'I am a text-based model'. "
-                    "Answer the user's question, analyze the code/text thoroughly, explain all bugs or errors found, and provide corrected code solutions."
-                )
-            if enriched and enriched[0].get("role") == "system":
-                enriched[0]["content"] = f"{enriched[0]['content']}\n\n{sys_addition}".strip()
-            else:
-                enriched.insert(0, {"role": "system", "content": sys_addition})
-
             for i in range(len(enriched) - 1, -1, -1):
                 if enriched[i].get("role") == "user":
                     user_q_text = enriched[i]["content"]
