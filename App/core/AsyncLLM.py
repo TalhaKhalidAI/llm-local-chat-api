@@ -827,7 +827,24 @@ class AsyncLLM:
         self.streaming = kwargs.get("streaming", False)
         self.repeat_penalty = kwargs.get("repeat_penalty", getattr(self.setting, "DEFAULT_REPEAT_PENALTY", 1.1))
         self.n_predict = kwargs.get("n_predict", getattr(self.setting, "DEFAULT_MAX_TOKENS", 2048))
-        self.stops = kwargs.get("stop", ["<|endoftext|>", "<|im_end|>"])
+        self.stops = kwargs.get(
+            "stop",
+            [
+                "<|endoftext|>",
+                "<|im_end|>",
+                "<|user|>",
+                "<|observation|>",
+                "<|eot_id|>",
+                "<|end_of_text|>",
+                "<|end_of_turn|>",
+                "<end_of_turn>",
+                "<eos>",
+                "<|end|>",
+                "<｜end▁of▁sentence｜>",
+                "<｜User｜>",
+                "</s>",
+            ],
+        )
         self._stream_lock = asyncio.Lock()
         self._stream_tasks: Dict[str, asyncio.Task] = {}
         self._last_usage: Dict[str, Dict[str, int]] = {}
@@ -836,6 +853,105 @@ class AsyncLLM:
         self._unload_allowed = asyncio.Event()
         self._unload_allowed.set()
         self._model_lock = asyncio.Lock()
+
+    # Exact per-model stop token map for all GGUF models in /mnt/llm_models/LLM_Models/
+    MODEL_STOP_TOKENS: Dict[str, List[str]] = {
+        "deepseek-coder-7b-instruct-v1.5-Q3_K_L.gguf": [
+            "<|EOT|>",
+            "<｜end▁of▁sentence｜>",
+            "### Instruction:",
+            "<|endoftext|>",
+            "</s>",
+        ],
+        "deepseek-llm-7b-chat.Q4_K_M.gguf.1": [
+            "<｜end▁of▁sentence｜>",
+            "User:",
+            "<|endoftext|>",
+            "</s>",
+        ],
+        "deepseek-v2-lite-chat-q4_k_m.gguf": [
+            "<｜end▁of▁sentence｜>",
+            "<｜User｜>",
+            "User:",
+            "<|endoftext|>",
+            "</s>",
+        ],
+        "gemma-2-9b-it-Q4_K_S.gguf": [
+            "<end_of_turn>",
+            "<eos>",
+            "<start_of_turn>user",
+            "<|endoftext|>",
+        ],
+        "gemma-2-9b-it-Q5_K_M.gguf": [
+            "<end_of_turn>",
+            "<eos>",
+            "<start_of_turn>user",
+            "<|endoftext|>",
+        ],
+        "glm-4-9b-chat-IQ4_XS.gguf": [
+            "<|endoftext|>",
+            "<|user|>",
+            "<|observation|>",
+        ],
+        "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf": [
+            "<|eot_id|>",
+            "<|end_of_text|>",
+            "<|start_header_id|>user<|end_header_id|>",
+            "<|endoftext|>",
+        ],
+        "openhermes-2.5-mistral-7b.Q4_K_S.gguf": [
+            "<|im_end|>",
+            "<|im_start|>user",
+            "</s>",
+            "<|endoftext|>",
+        ],
+        "qwen2.5-coder-7b-instruct-q4_k_m.gguf": [
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|im_start|>user",
+        ],
+        "Qwen2-VL-2B-Instruct-Q4_K_M.gguf": [
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<|im_start|>user",
+        ],
+        "SmolVLM-500M-Instruct-Q8_0.gguf": [
+            "<end_of_utterance>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "User:",
+        ],
+    }
+
+    def get_stops_for_model(self, model_name: Optional[str] = None, user_stops: Optional[List[str]] = None) -> List[str]:
+        """
+        Return the exact hardcoded stop tokens for the given model (or loaded model),
+        merged with universal fallbacks and any custom `user_stops` passed in the API request.
+        """
+        target = model_name or (list(self.current_model.keys())[0] if self.current_model else "")
+        exact = list(self.MODEL_STOP_TOKENS.get(target, []))
+        if not exact and target:
+            low = target.lower()
+            if "glm-4" in low or "glm4" in low:
+                exact = ["<|endoftext|>", "<|user|>", "<|observation|>"]
+            elif "gemma" in low:
+                exact = ["<end_of_turn>", "<eos>", "<start_of_turn>user"]
+            elif "llama-3" in low or "llama3" in low:
+                exact = ["<|eot_id|>", "<|end_of_text|>"]
+            elif "deepseek-coder" in low:
+                exact = ["<|EOT|>", "<｜end▁of▁sentence｜>", "### Instruction:"]
+            elif "deepseek" in low:
+                exact = ["<｜end▁of▁sentence｜>", "<｜User｜>", "User:"]
+            elif "qwen" in low or "openhermes" in low:
+                exact = ["<|im_end|>", "<|endoftext|>"]
+            elif "smolvlm" in low:
+                exact = ["<end_of_utterance>", "<|im_end|>", "<|endoftext|>"]
+
+        merged: List[str] = []
+        for tok in exact + list(self.stops) + (list(user_stops) if user_stops else []):
+            if tok and tok not in merged:
+                merged.append(tok)
+        return merged
     def pop_last_usage(self, task_id: str) -> Dict[str, int]:
         return self._last_usage.pop(task_id, {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
 
@@ -1155,20 +1271,25 @@ class AsyncLLM:
 
                 piece = ""
                 if not is_eog:
-                    tok_bytes = model.detokenize([tok])
-                    seq["byte_buf"].extend(tok_bytes)
-                    # Flush valid UTF-8 prefix safely
-                    try:
-                        piece = seq["byte_buf"].decode("utf-8")
-                        seq["byte_buf"].clear()
-                    except UnicodeDecodeError:
-                        for cut in range(len(seq["byte_buf"]) - 1, -1, -1):
-                            try:
-                                piece = seq["byte_buf"][:cut].decode("utf-8")
-                                del seq["byte_buf"][:cut]
-                                break
-                            except UnicodeDecodeError:
-                                continue
+                    tok_bytes = model.detokenize([tok], special=True)
+                    tok_str = tok_bytes.decode("utf-8", errors="ignore").strip()
+                    if tok_str in seq["stops"]:
+                        is_eog = True
+                    else:
+                        normal_bytes = model.detokenize([tok])
+                        seq["byte_buf"].extend(normal_bytes)
+                        # Flush valid UTF-8 prefix safely
+                        try:
+                            piece = seq["byte_buf"].decode("utf-8")
+                            seq["byte_buf"].clear()
+                        except UnicodeDecodeError:
+                            for cut in range(len(seq["byte_buf"]) - 1, -1, -1):
+                                try:
+                                    piece = seq["byte_buf"][:cut].decode("utf-8")
+                                    del seq["byte_buf"][:cut]
+                                    break
+                                except UnicodeDecodeError:
+                                    continue
 
                 seq["text_buf"] += piece
                 seq["next_token"] = tok
@@ -1206,17 +1327,22 @@ class AsyncLLM:
         logger.info(f"True Continuous Batching Scheduler active ({self.continuous_batch_slots} sequence slot(s)).")
         active_seqs: Dict[int, dict] = {}
         model: Optional[llama_cpp.Llama] = None
+        pending_task: Optional[dict] = None
 
         try:
             while self._running_event.is_set():
                 # 1. Admit queued requests into any free sequence slots
                 while not self._available_slots.empty():
-                    if not active_seqs and self.waiting_queue.empty():
-                        break
-                    try:
-                        task = self.waiting_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
+                    if pending_task is not None:
+                        task = pending_task
+                        pending_task = None
+                    else:
+                        if not active_seqs and self.waiting_queue.empty():
+                            break
+                        try:
+                            task = self.waiting_queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
 
                     future = task["future"]
                     if future.cancelled() or future.done():
@@ -1243,8 +1369,8 @@ class AsyncLLM:
                             head_keep = min(256, max_prompt // 4)
                             tail_keep = max_prompt - head_keep
                             prompt_tokens = prompt_tokens[:head_keep] + prompt_tokens[-tail_keep:]
-                        stops_val = task.get("stop")
-                        stops_val = self.stops if stops_val is None else stops_val
+                        active_model_name = list(self.current_model.keys())[0] if self.current_model else None
+                        stops_val = self.get_stops_for_model(active_model_name, task.get("stop"))
 
                         active_seqs[slot_id] = {
                             "task": task,
@@ -1270,14 +1396,10 @@ class AsyncLLM:
                         await self._available_slots.put(slot_id)
                         await self._release_model()
 
-                # 2. If nothing active, wait briefly for next request
+                # 2. If nothing active, wait briefly for next request (hold in pending_task without re-putting)
                 if not active_seqs:
                     try:
-                        task = await asyncio.wait_for(self.waiting_queue.get(), timeout=0.5)
-                        # Put back at front? Re-enqueue cleanly via local variable by putting back if needed
-                        # Instead, process directly on next loop by putting into a temporary pending slot
-                        await self.waiting_queue.put(task)
-                        self.waiting_queue.task_done()
+                        pending_task = await asyncio.wait_for(self.waiting_queue.get(), timeout=0.5)
                         continue
                     except asyncio.TimeoutError:
                         continue

@@ -1,8 +1,11 @@
 from App.repository.llmRepository import llmChatRepo
-from App.core.orchestrator import ChatOrchestrator
+from App.core.orchestrator import ChatOrchestrator, detect_upload_kind
+from App.api.dependencies.auth import decode_jwt
 from App.core.exceptions import (
+    FileTooLargeError,
     ImageTooLargeError,
     InvalidCollectionError,
+    InvalidFileError,
     InvalidImageError,
     MissingRequestFieldError,
     ModelNotLoadedError,
@@ -152,6 +155,85 @@ def _extract_tool_calls(content: str, tools: list[dict] | None) -> list[dict] | 
     return None
 
 
+def _resolve_tenant(
+    req: Request,
+    explicit_user_id: str | None = None,
+    explicit_session_id: str | None = None,
+) -> tuple[str, str]:
+    """
+    Resolve `(user_id, session_id)` for strict multi-tenant ChromaDB & RAM isolation:
+      1. JWT `Authorization: Bearer <token>` (`sub` / `user_id`) if present
+      2. Explicit `user_id` / `session_id` in request body, form, or query params
+      3. `X-User-ID` and `X-Session-ID` HTTP headers
+      4. Auto-generated random UUID (`user_<hex>` / `sess_<hex>`) if omitted by client
+    """
+    jwt_user: str | None = None
+    auth_hdr = req.headers.get("authorization", "")
+    if auth_hdr.lower().startswith("bearer "):
+        token = auth_hdr.split(" ", 1)[1].strip()
+        payload = decode_jwt(token) if token else None
+        if isinstance(payload, dict):
+            jwt_user = str(payload.get("sub") or payload.get("user_id") or "") or None
+
+    clean_uid = explicit_user_id.strip() if (explicit_user_id and explicit_user_id.strip() not in ("", "string", "null", "None")) else None
+    clean_sid = explicit_session_id.strip() if (explicit_session_id and explicit_session_id.strip() not in ("", "string", "null", "None")) else None
+
+    uid = (
+        jwt_user
+        or clean_uid
+        or req.headers.get("x-user-id")
+        or f"user_{uuid4().hex[:16]}"
+    )
+    sid = (
+        clean_sid
+        or req.headers.get("x-session-id")
+        or f"sess_{uuid4().hex[:16]}"
+    )
+    return str(uid).strip(), str(sid).strip()
+
+
+def _parse_system_prompts_chain(system_prompts_raw: str | None) -> list[dict[str, str]]:
+    """
+    Parse `system_prompts` form field containing a JSON list of objects (or strings)
+    for chaining multiple system instructions before the main user prompt.
+    Accepted formats:
+      - `[{"content": "You are Dr. Aris..."}, {"content": "Always respond in Markdown."}]`
+      - `[{"role": "system", "content": "..."}, {"system": "..."}]`
+      - `["System prompt 1", "System prompt 2"]`
+      - Single JSON object `{"content": "..."}` or plain string fallback
+    """
+    if not system_prompts_raw or not system_prompts_raw.strip() or system_prompts_raw.strip() == "string":
+        return []
+    raw = system_prompts_raw.strip()
+    parsed: Any = None
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        # Plain text fallback if user typed a raw string instead of JSON list
+        return [{"role": "system", "content": raw}]
+
+    if isinstance(parsed, dict):
+        parsed = [parsed]
+    if not isinstance(parsed, list):
+        return [{"role": "system", "content": str(parsed)}]
+
+    chain: list[dict[str, str]] = []
+    for item in parsed:
+        if isinstance(item, str) and item.strip():
+            chain.append({"role": "system", "content": item.strip()})
+        elif isinstance(item, dict):
+            txt = (
+                item.get("content")
+                or item.get("system")
+                or item.get("prompt")
+                or item.get("text")
+                or ""
+            )
+            if isinstance(txt, str) and txt.strip() and txt.strip() != "string":
+                chain.append({"role": "system", "content": txt.strip()})
+    return chain
+
+
 async def _require_loaded_model(repo: llmChatRepo, requested_model: str | None = None) -> str:
     """Ensure a model is already loaded (never auto-load on chat/vision endpoints)."""
     is_ready = await repo.is_ready()
@@ -171,10 +253,15 @@ async def _require_loaded_model(repo: llmChatRepo, requested_model: str | None =
 async def completion(
     req: Request,
     request: ChatRequest | None = Form(default=None, description="ChatRequest JSON"),
-    image: UploadFile | None = File(default=None, description="Optional image upload (processed strictly in RAM)"),
+    image: UploadFile | None = File(
+        default=None,
+        description="Optional file or image upload (auto-detects Images, PDF, Scanned PDF, DOCX, XLSX, CSV, ZIP, JSON, TXT, Code strictly in RAM)",
+    ),
     repo: llmChatRepo = Depends(get_repo),
 ):
-    image_bytes: bytes | None = None
+    uploaded_bytes: bytes | None = None
+    uploaded_filename: str | None = None
+    uploaded_kind: str | None = None
     ctype = req.headers.get("content-type", "").lower()
 
     if ctype.startswith("application/json"):
@@ -184,38 +271,52 @@ async def completion(
         if request is None:
             raise MissingRequestFieldError("Missing 'request' JSON form field")
         if image is not None and image.filename:
-            image_bytes = await image.read()
-            if not image_bytes:
-                raise InvalidImageError("Uploaded image is empty")
-            if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
-                raise ImageTooLargeError("Image exceeds 15MB limit")
+            uploaded_bytes = await image.read()
+            uploaded_filename = image.filename
+            if not uploaded_bytes:
+                raise InvalidFileError("Uploaded file is empty")
+            if len(uploaded_bytes) > MAX_IMAGE_UPLOAD_BYTES:
+                raise FileTooLargeError("Uploaded file exceeds 15MB limit")
+            uploaded_kind, _ = detect_upload_kind(uploaded_bytes, uploaded_filename)
 
     active_model = await _require_loaded_model(repo, request.model)
     request.model = active_model
-    logger.info(f"Chat request - Model: {request.model}, Messages: {len(request.messages)}, Image: {image_bytes is not None}")
+    tenant_user_id, tenant_session_id = _resolve_tenant(
+        req,
+        explicit_user_id=getattr(request, "user_id", None),
+        explicit_session_id=getattr(request, "session_id", None),
+    )
+    logger.info(
+        f"Chat request - Model: {request.model}, User: {tenant_user_id}, Session: {tenant_session_id}, "
+        f"Messages: {len(request.messages)}, Upload: {uploaded_filename} ({uploaded_kind})"
+    )
 
     # ============================================
-    # 1. ORCHESTRATION (RAG + WEB SEARCH + VISION) -> NATIVE TEMPLATE PROMPT
+    # 1. ORCHESTRATION (RAG + WEB SEARCH + DIRECT URL SCRAPE + VISION + UNIVERSAL DOC PARSER)
     # ============================================
     orch_ctx = None
     should_orchestrate = settings.ORCH_ENABLED and (
         getattr(request, "use_orchestrator", True)
         or getattr(request, "use_web", None) is True
         or getattr(request, "use_rag", None) is True
-        or image_bytes is not None
+        or uploaded_bytes is not None
         or getattr(request, "image_base64", None) is not None
     )
     if should_orchestrate:
         orch_ctx = await _orchestrator.prepare_context(
             request.messages,
-            image_bytes=image_bytes,
+            file_bytes=uploaded_bytes,
+            filename=uploaded_filename,
             image_base64=getattr(request, "image_base64", None),
             force_web=getattr(request, "use_web", None),
             force_rag=getattr(request, "use_rag", None),
+            user_id=tenant_user_id,
+            session_id=tenant_session_id,
         )
         raw_messages = orch_ctx.enriched_messages
         logger.info(
-            f"🧭 Orchestrator route={orch_ctx.route.model_dump()} | "
+            f"🧭 Orchestrator route={orch_ctx.route.model_dump()} | user={tenant_user_id} | session={tenant_session_id} | "
+            f"doc={f'{orch_ctx.document_report.file_type}:{orch_ctx.document_report.doc_profile}' if orch_ctx.document_report else None} | "
             f"citations={len(orch_ctx.citations)} | metrics={orch_ctx.metrics_ms}"
         )
     else:
@@ -269,6 +370,8 @@ async def completion(
                     "object": "chat.completion.chunk",
                     "created": created,
                     "model": request.model,
+                    "user_id": tenant_user_id,
+                    "session_id": tenant_session_id,
                     "choices": [{
                         "index": 0,
                         "delta": delta,
@@ -309,6 +412,8 @@ async def completion(
                     answer="".join(collected),
                     model_used=request.model,
                     route=orch_ctx.route,
+                    user_id=tenant_user_id,
+                    session_id=tenant_session_id,
                 )
 
         return StreamingResponse(
@@ -330,6 +435,47 @@ async def completion(
     meta = getattr(ai_msg, "response_metadata", {}) or {}
     exact_usage = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
     tool_calls = _extract_tool_calls(content, request.tools)
+
+    # If the LLM invoked one of the orchestrator's internal document/web tools, execute it and synthesize final answer
+    internal_tools = {
+        "search_document",
+        "read_document_pages",
+        "query_table_data",
+        "inspect_page_visual",
+        "scrape_website",
+        "web_search",
+    }
+    if tool_calls and tool_calls[0]["function"]["name"] in internal_tools:
+        t_call = tool_calls[0]["function"]
+        t_name = t_call["name"]
+        try:
+            t_args = json.loads(t_call["arguments"]) if isinstance(t_call["arguments"], str) else t_call["arguments"]
+        except Exception:
+            t_args = {}
+        logger.info(f"🔧 Executing internal orchestrator tool: {t_name}({t_args}) for user={tenant_user_id}")
+        tool_output = await _orchestrator.execute_internal_tool(
+            t_name,
+            t_args,
+            user_id=tenant_user_id,
+            session_id=tenant_session_id,
+        )
+        followup_msgs = list(raw_messages) + [
+            {"role": "assistant", "content": content},
+            {"role": "user", "content": f"<tool_output name='{t_name}'>\n{tool_output}\n</tool_output>\nNow answer the user's question directly using this tool output."},
+        ]
+        followup_prompt = await repo.format_messages_native(followup_msgs)
+        async with _orchestrator.vram_gate:
+            ai_msg2 = await repo.chat_with_metadata(prompt=followup_prompt, **gen_kwargs)
+        content = ai_msg2.content if hasattr(ai_msg2, "content") else str(ai_msg2)
+        meta2 = getattr(ai_msg2, "response_metadata", {}) or {}
+        u2 = meta2.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+        exact_usage = {
+            "prompt_tokens": exact_usage.get("prompt_tokens", 0) + u2.get("prompt_tokens", 0),
+            "completion_tokens": exact_usage.get("completion_tokens", 0) + u2.get("completion_tokens", 0),
+            "total_tokens": exact_usage.get("total_tokens", 0) + u2.get("total_tokens", 0),
+        }
+        tool_calls = None
+
     finish_reason = "tool_calls" if tool_calls else meta.get("finish_reason", "stop")
 
     if orch_ctx is not None:
@@ -338,6 +484,8 @@ async def completion(
             answer=content,
             model_used=request.model,
             route=orch_ctx.route,
+            user_id=tenant_user_id,
+            session_id=tenant_session_id,
         )
 
     logger.info(f"✅ LLM response received: {content[:100]}...")
@@ -347,6 +495,8 @@ async def completion(
         object="chat.completion",
         created=int(time.time()),
         model=request.model,
+        user_id=tenant_user_id,
+        session_id=tenant_session_id,
         choices=[
             ChatChoice(
                 index=0,
@@ -621,29 +771,45 @@ async def get_active_model(repo: llmChatRepo = Depends(get_repo)):
 
 @llmRouter.get("/history")
 async def view_vector_history(
+    req: Request,
     collection: str = Query(default="chat_history", description="chat_history | web_cache | image_index | docs_rag"),
+    user_id: str | None = Query(default=None, description="Filter by user_id (defaults to current user)"),
+    session_id: str | None = Query(default=None, description="Optional session_id filter"),
     limit: int = Query(default=20, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
-    """View stored records from the local ChromaDB vector store."""
-    return await orch.memory.list_entries(collection_name=collection, limit=limit, offset=offset)
+    """View stored records from the local ChromaDB vector store isolated by user_id/session_id."""
+    uid, _ = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
+    return await orch.memory.list_entries(
+        collection_name=collection,
+        limit=limit,
+        offset=offset,
+        user_id=uid if user_id is not None or req.headers.get("authorization") or req.headers.get("x-user-id") else user_id,
+        session_id=session_id,
+    )
 
 
 @llmRouter.get("/history/search")
 async def search_vector_history(
+    req: Request,
     q: str = Query(..., min_length=1, description="Semantic search query"),
     collection: str = Query(default="chat_history", description="chat_history | web_cache | image_index | docs_rag"),
+    user_id: str | None = Query(default=None, description="Tenant user_id filter"),
+    session_id: str | None = Query(default=None, description="Optional session_id filter"),
     n_results: int = Query(default=5, ge=1, le=20),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
-    """Semantic search across ChromaDB history (chat turns, cached web pages, indexed images, docs)."""
+    """Semantic search across ChromaDB history strictly isolated by user_id and optional session_id."""
     if collection not in orch.memory.VALID_COLLECTIONS:
         raise InvalidCollectionError(
             f"Invalid collection '{collection}'. Choose from {orch.memory.VALID_COLLECTIONS}"
         )
-    hits = await orch.memory.query(collection_name=collection, query=q, n_results=n_results)
-    return {"query": q, "collection": collection, "count": len(hits), "results": hits}
+    uid, _ = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
+    effective_uid = uid if (user_id is not None or req.headers.get("authorization") or req.headers.get("x-user-id")) else None
+    where = None if collection == "web_cache" else orch.memory.build_tenant_where(user_id=effective_uid, session_id=session_id)
+    hits = await orch.memory.query(collection_name=collection, query=q, n_results=n_results, where=where)
+    return {"query": q, "collection": collection, "user_id": effective_uid, "session_id": session_id, "count": len(hits), "results": hits}
 
 
 # ============================================
@@ -679,28 +845,47 @@ MAX_IMAGE_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB RAM guard
 
 @llmRouter.post("/vision/describe")
 async def describe_uploaded_image(
+    req: Request,
     image: UploadFile = File(..., description="Image file processed strictly in RAM"),
     prompt: str = Form(default="", description="Optional question or focus hint for Qwen2-VL"),
+    user_id: str | None = Form(default=None),
+    session_id: str | None = Form(default=None),
     repo: llmChatRepo = Depends(get_repo),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
-    """Upload an image -> decode in RAM with Qwen2-VL-2B -> index in ChromaDB (requires loaded model)."""
+    """Upload an image -> decode in RAM with Qwen2-VL-2B -> index in ChromaDB isolated by (user_id, session_id)."""
     await _require_loaded_model(repo)
+    uid, sid = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
     image_bytes = await image.read()
     if not image_bytes:
         raise InvalidImageError("Uploaded image is empty")
     if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
         raise ImageTooLargeError("Image exceeds 15MB limit")
 
-    report = await orch.vision_tool.describe_and_index(image_bytes=image_bytes, user_hint=prompt)
-    return {"status": "ok", "vision_report": report.model_dump()}
+    report = await orch.vision_tool.describe_and_index(
+        image_bytes=image_bytes,
+        user_hint=prompt,
+        user_id=uid,
+        session_id=sid,
+    )
+    return {"status": "ok", "user_id": uid, "session_id": sid, "vision_report": report.model_dump()}
 
 
 @llmRouter.post("/chat/completions/upload")
 async def chat_with_uploaded_image(
+    req: Request,
     model: str = Form(...),
-    prompt: str = Form(...),
-    image: UploadFile | None = File(default=None, description="Optional image processed strictly in RAM"),
+    prompt: str = Form(..., description="Main user prompt/question"),
+    system_prompts: str | None = Form(
+        default='[{"content": "You are a helpful AI assistant."}]',
+        description='JSON list of system prompt objects for multi-chain system instructions, e.g. [{"content": "You are an expert..."}, {"content": "Be concise."}]',
+    ),
+    image: UploadFile | None = File(
+        default=None,
+        description="Optional file or image processed strictly in RAM (auto-detects Image, PDF, DOCX, XLSX, CSV, ZIP, TXT, Code)",
+    ),
+    user_id: str | None = Form(default=None),
+    session_id: str | None = Form(default=None),
     use_web: bool | None = Form(default=None),
     use_rag: bool | None = Form(default=None),
     temperature: float | None = Form(default=None),
@@ -708,22 +893,36 @@ async def chat_with_uploaded_image(
     repo: llmChatRepo = Depends(get_repo),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
-    """Chat with optional uploaded image + prompt (never auto-loads model; raises ModelNotLoadedError if unloaded)."""
+    """Chat with optional uploaded file/image + chained JSON list of system prompts + main user prompt (strictly isolated by user_id & session_id)."""
     active_model = await _require_loaded_model(repo, model)
+    uid, sid = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
 
-    image_bytes: bytes | None = None
+    uploaded_bytes: bytes | None = None
+    uploaded_filename: str | None = None
     if image is not None and image.filename:
-        image_bytes = await image.read()
-        if not image_bytes:
-            raise InvalidImageError("Uploaded image is empty")
-        if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
-            raise ImageTooLargeError("Image exceeds 15MB limit")
+        uploaded_bytes = await image.read()
+        uploaded_filename = image.filename
+        if not uploaded_bytes:
+            raise InvalidFileError("Uploaded file is empty")
+        if len(uploaded_bytes) > MAX_IMAGE_UPLOAD_BYTES:
+            raise FileTooLargeError("Uploaded file exceeds 15MB limit")
+
+    sys_chain = _parse_system_prompts_chain(system_prompts)
+    messages_chain: list[dict[str, str]] = []
+    if sys_chain:
+        # Combine chained system prompts in order into the system role (and keep individual entries if supported)
+        combined_sys = "\n\n".join(f"[System Instruction {i+1}]\n{s['content']}" if len(sys_chain) > 1 else s["content"] for i, s in enumerate(sys_chain))
+        messages_chain.append({"role": "system", "content": combined_sys})
+    messages_chain.append({"role": "user", "content": prompt})
 
     orch_ctx = await orch.prepare_context(
-        [{"role": "user", "content": prompt}],
-        image_bytes=image_bytes,
+        messages_chain,
+        file_bytes=uploaded_bytes,
+        filename=uploaded_filename,
         force_web=use_web,
         force_rag=use_rag,
+        user_id=uid,
+        session_id=sid,
     )
     formatted_prompt = await repo.format_messages_native(orch_ctx.enriched_messages)
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
@@ -736,14 +935,188 @@ async def chat_with_uploaded_image(
         answer=content,
         model_used=active_model,
         route=orch_ctx.route,
+        user_id=uid,
+        session_id=sid,
     )
     return {
         "id": f"chatcmpl-{uuid4().hex[:8]}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": active_model,
+        "user_id": uid,
+        "session_id": sid,
+        "system_prompts_count": len(sys_chain),
         "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
         "vision_report": orch_ctx.vision_report.model_dump() if orch_ctx.vision_report else None,
+        "document_report": (
+            orch_ctx.document_report.model_dump(exclude={"full_text", "pages"})
+            if orch_ctx.document_report
+            else None
+        ),
         "citations": [c.model_dump() for c in orch_ctx.citations],
         "metrics_ms": orch_ctx.metrics_ms,
+    }
+
+
+@llmRouter.post("/chat/completions/code")
+async def chat_with_uploaded_code(
+    req: Request,
+    model: str = Form(...),
+    prompt: str = Form(..., description="Main coding question/instruction (user prompt)"),
+    system_prompts: str | None = Form(
+        default='[{"content": "You are a principal software architect and polyglot compiler/AST engineer."}]',
+        description='JSON list of system prompt objects for multi-chain coding instructions, e.g. [{"content": "You are a senior Rust/Python architect."}, {"content": "Focus on time complexity and clean code."}]',
+    ),
+    code_file: UploadFile | None = File(
+        default=None,
+        description="Upload ANY code file in ANY programming language (processed 100% in RAM via AST splitting & token-saving skeleton compression)",
+    ),
+    user_id: str | None = Form(default=None),
+    session_id: str | None = Form(default=None),
+    use_web: bool | None = Form(default=False),
+    use_rag: bool | None = Form(default=True),
+    temperature: float | None = Form(default=0.2),
+    max_tokens: int | None = Form(default=1024),
+    repo: llmChatRepo = Depends(get_repo),
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """
+    Dedicated Coding & AST Analysis Endpoint:
+    - Accepts code files in ANY language in the world (Python, JS/TS, C/C++, Rust, Go, Java, C#, PHP, Ruby, Solidity, SQL, Bash, etc.).
+    - Splits code into AST nodes in RAM and indexes every function/class/symbol into ChromaDB (`docs_rag`) isolated by `(user_id, session_id)`.
+    - Automatically compresses large code files into an AST Skeleton + top relevant AST symbols when code length exceeds the context window budget.
+    """
+    from App.core.orchestrator import UniversalCodeASTProcessor, ParsedPage, ParsedDocumentReport
+
+    active_model = await _require_loaded_model(repo, model)
+    uid, sid = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
+
+    t0 = time.perf_counter()
+    ast_report: dict | None = None
+    code_context_block = ""
+
+    # Calculate safe token-saving character budget based on active model's per-sequence KV context window
+    per_seq_ctx = max(512, repo.n_ctx // max(1, repo.continuous_batch_slots))
+    reserve_gen = min(int(max_tokens or 1024), max(256, per_seq_ctx // 3))
+    max_code_chars = max(1400, (per_seq_ctx - reserve_gen - 450) * 3)
+
+    if code_file is not None and code_file.filename:
+        code_bytes = await code_file.read()
+        if not code_bytes:
+            raise InvalidFileError("Uploaded code file is empty")
+        if len(code_bytes) > MAX_IMAGE_UPLOAD_BYTES:
+            raise FileTooLargeError("Uploaded code file exceeds 15MB limit")
+
+        ast_report = await asyncio.to_thread(
+            UniversalCodeASTProcessor.process_code_in_ram,
+            code_bytes,
+            code_file.filename,
+            prompt,
+            max_code_chars,
+        )
+        code_context_block = ast_report["context_payload"]
+
+        # Index each AST node into ChromaDB `docs_rag` isolated by (uid, sid) so follow-up questions in the same session can query any symbol!
+        ast_pages = [
+            ParsedPage(
+                page_number=idx,
+                title=f"{node['kind']}: {node['symbol']} (L{node['start_line']}-L{node['end_line']})",
+                text=f"// Symbol: {node['symbol']} | Signature: {node['signature']}\n{node['code']}",
+            )
+            for idx, node in enumerate(ast_report["ast_nodes"], start=1)
+        ] or [ParsedPage(page_number=1, title=code_file.filename, text=code_bytes.decode("utf-8", errors="ignore")[:2400])]
+
+        doc_rep = ParsedDocumentReport(
+            doc_id=f"code_{uuid4().hex[:16]}",
+            filename=code_file.filename,
+            file_type="code",
+            doc_profile="structured_code_or_json",
+            mime_type="text/plain",
+            user_id=uid,
+            session_id=sid,
+            total_pages=len(ast_pages),
+            total_chars=ast_report["raw_chars"],
+            total_chunks=len(ast_pages),
+            toc_summary=ast_report["skeleton"][:800],
+            pages=ast_pages,
+            full_text=code_context_block,
+        )
+        await orch.memory.index_parsed_document(doc_rep)
+
+    sys_chain = _parse_system_prompts_chain(system_prompts)
+    messages_chain: list[dict[str, str]] = []
+    if sys_chain:
+        combined_sys = "\n\n".join(
+            f"[System Instruction {i+1}]\n{s['content']}" if len(sys_chain) > 1 else s["content"]
+            for i, s in enumerate(sys_chain)
+        )
+        messages_chain.append({"role": "system", "content": combined_sys})
+    else:
+        messages_chain.append({
+            "role": "system",
+            "content": "You are a principal software architect and polyglot AST engineer. Provide accurate, production-ready code and explanations.",
+        })
+
+    user_content = f"{code_context_block}\n\nCoding Task / Question: {prompt}".strip() if code_context_block else prompt
+    messages_chain.append({"role": "user", "content": user_content})
+
+    # Also allow retrieving previously uploaded code AST chunks or session memory in the same (uid, sid)
+    orch_ctx = await orch.prepare_context(
+        messages_chain,
+        force_web=use_web,
+        force_rag=bool(use_rag and code_file is None),
+        user_id=uid,
+        session_id=sid,
+    )
+    formatted_prompt = await repo.format_messages_native(orch_ctx.enriched_messages)
+    gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
+    async with orch.vram_gate:
+        ai_msg = await repo.chat_with_metadata(prompt=formatted_prompt, **gen_kwargs)
+
+    content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
+    meta = getattr(ai_msg, "response_metadata", {}) or {}
+    exact_usage = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+
+    await orch.memory.record_chat_turn(
+        query=prompt,
+        answer=content,
+        model_used=active_model,
+        route=orch_ctx.route,
+        user_id=uid,
+        session_id=sid,
+    )
+
+    elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
+    return {
+        "id": f"chatcmpl-{uuid4().hex[:8]}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": active_model,
+        "user_id": uid,
+        "session_id": sid,
+        "system_prompts_count": len(sys_chain),
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": meta.get("finish_reason", "stop"),
+            }
+        ],
+        "usage": exact_usage,
+        "ast_report": (
+            {
+                "filename": ast_report["filename"],
+                "language": ast_report["language"],
+                "raw_chars": ast_report["raw_chars"],
+                "compact_chars": ast_report["compact_chars"],
+                "compressed_via_ast": ast_report["compressed_via_ast"],
+                "max_code_chars_budget": max_code_chars,
+                "total_ast_nodes": ast_report["total_ast_nodes"],
+                "selected_ast_symbols": ast_report["selected_ast_symbols"],
+            }
+            if ast_report
+            else None
+        ),
+        "citations": [c.model_dump() for c in orch_ctx.citations],
+        "metrics_ms": {**orch_ctx.metrics_ms, "total_code_ep_ms": elapsed_ms},
     }

@@ -15,16 +15,28 @@ A production-grade FastAPI local LLM serving platform featuring **True Iteration
 - **Grammar-Enforced Structured Output & Tool Calling**: Supports OpenAI-compatible `response_format` (`json_object` and `json_schema` compiled to C++ GBNF grammars), `tools`, `tool_choice`, and structured `tool_calls`.
 - **Exact Token Accounting & Generation Budget Reservation**: Tracks exact `prompt_tokens`, `completion_tokens`, and `total_tokens` (including `stream_options.include_usage` on SSE streams) and reserves generation token headroom so long RAG/web prompts never truncate answers prematurely.
 - **Client Disconnect Cancellation**: Automatically aborts token generation and frees the KV sequence slot (`llama_memory_seq_rm`) when a streaming client disconnects.
+- **Hardcoded Model Stop Tokens Matrix & Special Control Token Handling**: Defines per-model native stop tokens across all 11 supported local models (`GLM-4`, `DeepSeek-V2-Lite`, `DeepSeek-Coder-7B`, `Meta-Llama-3.1-8B`, `Qwen2.5-Coder-7B`, `Qwen2-VL-2B`, `Gemma-2-9B`, `SmolVLM-500M`, `OpenHermes-2.5`). Uses `detokenize([tok], special=True)` during continuous batching so special control tokens (such as `<|user|>`, `<|observation|>`, `<|im_end|>`) are cleanly detected without hanging.
 - **Explicit Model Lifecycle (No Unwanted Auto-Loading)**: Chat and Vision endpoints strictly require a model to be loaded via `POST /app/v1/load_model` first, returning a structured `MODEL_NOT_LOADED` (`400`) error if no model is active.
 
 ### 2. Multimodal AI Orchestrator (`App/core/orchestrator.py`)
-- **Persistent Local ChromaDB (`./chroma_db`)**: Thread-safe vector memory with 4 collections and an offline-safe 384-d embedding fallback:
-  - `web_cache`: Scraped web search & news chunks with configurable TTL expiration (`ORCH_WEB_CACHE_TTL_HOURS`).
-  - `image_index`: Structured vision descriptions, detected objects, tags, and OCR text indexed by SHA-256 hash.
-  - `docs_rag`: Local knowledge-base document chunks.
-  - `chat_history`: Past Q&A turns with model and routing metadata.
-- **Live Internet Search & Direct YouTube Lookup**:
-  - Multi-tier search using DuckDuckGo (`ddgs` / HTML) with automatic fallback to Bing News RSS & Google News RSS, plus direct YouTube video tutorial lookup (`watch?v=` URLs).
+- **Strict Multi-Tenant Isolation (`user_id` & `session_id`)**:
+  - Full cryptographic and vector isolation for all ChromaDB collections (`chat_history`, `docs_rag`, `web_cache`, `image_index`) and in-RAM buffers.
+  - Automatic tenant resolution cascade: Authenticated JWT Claims -> Request Body/Form fields -> HTTP Headers (`X-User-ID`, `X-Session-ID`) -> Auto-generated deterministic random tenant UUIDs (`user_<hex>`, `sess_<hex>`).
+  - Tenant IDs are returned in all completion responses (`user_id`, `session_id`) to ensure frontends can persist conversations seamlessly.
+- **Adaptive 4-Profile Document Indexing Engine (`UniversalDocumentParser`)**:
+  - **100% In-RAM Processing**: Strictly operates in system RAM—never writes uploaded PDFs, Office docs, spreadsheets, or archives to disk.
+  - **Automatic Profile Classification**:
+    1. `datasheet_or_table`: Detects tabular/datasheet formats and automatically replicates markdown table headers across every chunk with semantic key-value serialization.
+    2. `mixed_doc_with_tables`: Hybrid chunking isolating narrative prose from embedded data tables.
+    3. `structured_code_or_json`: Syntax-preserving block chunking for config, schema, and source files.
+    4. `plain_narrative`: Overlapping semantic paragraph chunking for prose, books, and articles.
+  - **Broad Format Support**: PDF (with automatic scanned-page OCR via `Qwen2-VL-2B`), DOCX, DOC, XLSX, CSV, TSV, ODT, EPUB, RTF, JSON, XML, HTML, ZIP/TAR, and source code.
+- **Smart Best-1 Memory Winner Selection with Refusal & Anti-Poisoning Guard**:
+  - Scores candidate memories using semantic cosine distance + turn length + factual boost.
+  - Filter out refusals, apologies, and hallucinations (`"I cannot"`, `"as an AI"`, `"I apologize"`) so unhelpful or toxic past turns never poison the active prompt context.
+- **Live Internet Search & Direct YouTube Subtitle Lookup**:
+  - Multi-tier search using DuckDuckGo (`ddgs` / HTML) with automatic fallback to Bing News RSS & Google News RSS.
+  - Direct YouTube Lookup: Parses `youtube.com/watch` URLs, extracts video metadata, and ingests timedtext video captions/transcripts for full video RAG.
   - Query sanitizer that strips conversational filler and corrects common typos before querying search engines.
   - SSRF-safe asynchronous HTML scraper (`_is_safe_public_url` blocking loopback/private/link-local IPs).
 - **100% In-RAM Photo Describer & OCR (`Qwen2-VL-2B-Instruct` + `mmproj`)**:
@@ -33,9 +45,17 @@ A production-grade FastAPI local LLM serving platform featuring **True Iteration
   - Bounded `asyncio.Queue(maxsize=10)` with sticky batching and CPU-only execution (`ORCH_VISION_GPU_LAYERS=0`) so the active chat LLM stays 100% resident in GPU VRAM.
   - Enforces a strict GBNF JSON schema (`VisionReport`: `scene`, `objects`, `subjects_and_details`, `colors_and_lighting`, `visible_text`, `summary`, `tags`, `search_query`).
 
-### 3. Centralized Exception Architecture (`main.py` & `App/core/exceptions.py`)
+### 3. Polyglot AST Coding & Repository Engine (`POST /app/v1/chat/completions/code`)
+- **Polyglot Syntax & Symbol Extraction (`UniversalCodeASTProcessor`)**: Native AST parsing and regex symbol extraction for Python, JavaScript/TypeScript, Rust, Go, Java, C/C++, PHP, Ruby, and Shell scripts.
+- **Token-Budget AST Skeleton Compression**: Generates high-level file skeletons (classes, functions, method signatures, exports) and selectively injects relevant AST nodes matching the user's coding query, enabling large files and multi-file codebases to fit comfortably within compact LLM context windows without losing critical structural context.
+
+### 4. Centralized Exception Architecture & Recovery (`main.py` & `App/core/exceptions.py`)
 - All application, validation, and runtime errors are caught centrally in `main.py` via FastAPI `@app.exception_handler(...)` decorators.
 - Custom exception hierarchy (`AppError`, `ModelNotLoadedError`, `ModelNotFoundError`, `ModelLoadError`, `QueueFullError`, `InvalidImageError`, `ImageTooLargeError`, `InvalidCollectionError`, `MissingRequestFieldError`, `InsufficientMemoryError`) returning uniform `{"error": "<CODE>", "detail": "..."}` JSON responses.
+- **Resilient Kill-Switch & Recovery**:
+  - Protected static assets (`/assets`) and health endpoints from inadvertent lockouts.
+  - Safe `jsonable_encoder` serialization preventing non-serializable validation exceptions from tripping the maintenance kill switch.
+  - Instant recovery endpoint: `POST /reset-kill-switch` to clear the emergency kill switch without server restarts.
 
 ### 4. Authentication, User Management & Security
 - JWT authentication with Argon2 password hashing.
@@ -160,13 +180,15 @@ Swagger UI is available offline at `http://localhost:8000/docs`.
 | POST | `/app/v1/unload_model` | Unload the active model and release VRAM/RAM |
 | GET | `/app/v1/active_model` | Inspect the currently loaded model, continuous batching slots, and memory usage |
 | GET | `/app/v1/models` | List all `.gguf` models available in `LLM_MODEL_PATH` |
-| POST | `/app/v1/chat/completions` | OpenAI-compatible chat completion supporting JSON or `multipart/form-data` (`request` JSON + optional `image` upload), RAG, live web search, tool calls, GBNF structured outputs, and SSE streaming |
+| POST | `/app/v1/chat/completions` | OpenAI-compatible chat completion supporting JSON or `multipart/form-data` (`request` JSON + optional `image`/document upload), strict tenant isolation (`user_id`, `session_id`), RAG, live web search, tool calls, GBNF structured outputs, and SSE streaming |
 | POST | `/app/v1/vision/describe` | Upload an image (processed 100% in RAM) to get a structured `VisionReport` + OCR and index it in ChromaDB |
-| POST | `/app/v1/chat/completions/upload` | Dedicated multipart upload endpoint for chatting about an uploaded image |
+| POST | `/app/v1/chat/completions/upload` | Dedicated multipart upload endpoint for chatting with uploaded files/images/documents (PDF, DOCX, XLSX, CSV, ZIP, Code) with chained JSON `system_prompts` and tenant isolation |
+| POST | `/app/v1/chat/completions/code` | Dedicated Polyglot AST Coding endpoint with AST skeleton extraction, symbol indexing, and token-saving compression for large source files |
 | GET | `/app/v1/web_search/test` | Diagnostic endpoint to test live web search & ChromaDB `web_cache` ingestion |
 | GET | `/app/v1/history` | List stored entries from any ChromaDB collection (`chat_history`, `web_cache`, `image_index`, `docs_rag`) |
 | GET | `/app/v1/history/search` | Semantic vector search across any ChromaDB collection |
 | GET | `/app/v1/health` | LLM engine health check, queue depth, and memory metrics |
+| POST | `/reset-kill-switch` | Instant recovery endpoint to clear emergency kill switch without server restart |
 
 ### Authentication & User Management (`/app/v1/users`)
 | Method | Endpoint | Description | Access |
@@ -235,6 +257,33 @@ curl -X POST "http://localhost:8000/app/v1/chat/completions" \
 curl -X POST "http://localhost:8000/app/v1/vision/describe" \
   -F "image=@/path/to/image.png" \
   -F "prompt=Extract all visible text and describe the scene"
+```
+
+### 5. Polyglot AST Coding & Repository Analysis
+```bash
+curl -X POST "http://localhost:8000/app/v1/chat/completions/code" \
+  -F "code_file=@/path/to/repository_code.py;type=text/x-python" \
+  -F "prompt=Optimize the memory allocation inside the AST processor" \
+  -F "model=deepseek-coder-7b-instruct-v1.5-Q3_K_L.gguf" \
+  -F "user_id=tenant_user_01" \
+  -F "session_id=coding_sess_42"
+```
+
+### 6. Document & File Chat with Chained System Prompts
+```bash
+curl -X POST "http://localhost:8000/app/v1/chat/completions/upload" \
+  -F "image=@/path/to/financial_datasheet.xlsx" \
+  -F "prompt=What were the Q3 operating margins and net profit?" \
+  -F 'system_prompts=["You are an expert financial analyst.", "Format all numbers as standard tables with USD currency symbols."]' \
+  -F "model=glm-4-9b-chat-IQ4_XS.gguf" \
+  -F "use_rag=true" \
+  -F "user_id=fin_analyst" \
+  -F "session_id=q3_report"
+```
+
+### 7. Emergency Reset for Kill Switch
+```bash
+curl -X POST "http://localhost:8000/reset-kill-switch"
 ```
 
 ---

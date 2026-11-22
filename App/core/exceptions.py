@@ -49,9 +49,19 @@ class InvalidImageError(AppError):
     error_code = "INVALID_IMAGE"
 
 
+class InvalidFileError(AppError):
+    status_code = status.HTTP_400_BAD_REQUEST
+    error_code = "INVALID_FILE"
+
+
 class ImageTooLargeError(AppError):
     status_code = status.HTTP_413_CONTENT_TOO_LARGE
     error_code = "IMAGE_TOO_LARGE"
+
+
+class FileTooLargeError(AppError):
+    status_code = status.HTTP_413_CONTENT_TOO_LARGE
+    error_code = "FILE_TOO_LARGE"
 
 
 class InvalidCollectionError(AppError):

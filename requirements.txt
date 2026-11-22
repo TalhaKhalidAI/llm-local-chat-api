@@ -1,0 +1,147 @@
+
+# ============================================
+# Core Web Framework
+# ============================================
+fastapi
+uvicorn[standard]
+starlette
+python-multipart
+email-validator
+
+# ============================================
+# Rate Limiting (THE FIX)
+# ============================================
+slowapi
+limits
+
+# ============================================
+# Pydantic & Settings
+# ============================================
+pydantic
+pydantic-settings
+annotated-types
+typing-extensions
+
+# ============================================
+# Auth & Security
+# ============================================
+python-jose
+passlib
+cryptography
+argon2-cffi
+rsa
+ecdsa
+pyasn1
+bcrypt
+cffi
+pycparser
+
+# ============================================
+# Database
+# ============================================
+SQLAlchemy
+aiosqlite
+alembic
+databases
+greenlet
+
+# ============================================
+# Postgres (optional - remove if not using)
+# ============================================
+psycopg[binary,pool]
+psycopg2-binary
+asyncpg
+langchain-postgres
+
+# ============================================
+# LangChain Ecosystem
+# ============================================
+langchain
+langchain-community
+langchain-core
+langchain-text-splitters
+langchain-huggingface
+langchain-chroma
+langchain-openai
+langchain-groq
+langgraph
+langsmith
+
+# ============================================
+# Search & Web Scraping
+# ============================================
+duckduckgo-search
+ddgs
+
+# ============================================
+# AI & Embeddings
+# ============================================
+sentence-transformers
+#transformers
+#torch
+huggingface-hub
+tokenizers
+#nvidiaonnxruntime
+fastembed
+
+# ============================================
+# Vector Store & Data
+# ============================================
+chromadb
+faiss-cpu
+numpy
+
+# ============================================
+# Async & HTTP
+# ============================================
+aiohttp
+anyio
+async-timeout
+httpx
+httpcore
+h11
+sniffio
+requests
+certifi
+charset-normalizer
+idna
+urllib3
+
+# ============================================
+# Utilities
+# ============================================
+python-dotenv
+tqdm
+psutil
+PyYAML
+rich
+typer
+click
+shellingham
+markdown-it-py
+mdurl
+Pygments
+tenacity
+asgi-correlation-id
+Mako
+MarkupSafe
+Jinja2
+
+# ============================================
+# Compat & Transitive
+# ============================================
+exceptiongroup
+tomli
+packaging
+zipp
+importlib_metadata
+wrapt
+Deprecated
+six
+python-dateutil
+filelock
+fsspec
+
+# llama-cpp-python is NOT here;
+# it will be installed separately with Vulkan support in Dockerfile
+

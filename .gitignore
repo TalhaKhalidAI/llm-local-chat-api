@@ -35,6 +35,7 @@ __pycache__
 *.pyo
 *.pyd
 *.txt
+!requirements.txt
 logs
 *.crt
 *.key

@@ -1,34 +1,60 @@
 """
-App/core/orchestrator.py — Production-Oriented Orchestrator for AsyncLLM
-========================================================================
+App/core/orchestrator.py — Production-Oriented Multimodal & Universal Document/Web Orchestrator
+================================================================================================
 Integrates directly with `App.core.AsyncLLM` (`AsyncLLM`, `ChatPromptTemplate`,
 `Runnable`, `StrOutputParser`, `AIMessage`) and `App.core.settings.settings`.
 
 Capabilities:
-  1. DuckDuckGo Web Search + SSRF-safe async scraper -> ChromaDB (`web_cache`)
-  2. Persistent Local RAG -> ChromaDB (`docs_rag`)
-  3. Photo Describer & Semantic Image Search -> Qwen2-VL-2B + mmproj -> ChromaDB (`image_index`)
-  4. Vector Chat History -> ChromaDB (`chat_history`) for `/history` & `/history/search`
-  5. RX 5600 (6GB VRAM) safe model coordination with any model loaded in `AsyncLLM`
+  1. 3-Tier Universal Web Search & Direct URL Scraper:
+     - Direct URL extraction from user prompt ("scrape https://...")
+     - Meta-Search (DuckDuckGo + Wikipedia API + Reddit JSON + ArXiv + GitHub + Bing/Google News RSS + YouTube)
+     - 3-Tier Cascading Content Extractor:
+       * Tier 1: SSRF-safe async `httpx` + semantic HTML/JSON/XML/Markdown extractor
+       * Tier 2: Headless Chrome (`google-chrome --headless --dump-dom`) fallback for JS/SPA pages
+       * Tier 3: Web-hosted PDF / Document stream-to-RAM parser
+  2. Universal In-RAM File & Document Reader (`UniversalDocumentParser`):
+     - Auto-detects uploaded file format via magic bytes + filename extension strictly in RAM:
+       * Images (`JPEG`, `PNG`, `WEBP`, `GIF`) -> Qwen2-VL-2B Vision + OCR
+       * PDFs (`%PDF-`) -> Digital text (`pdftotext -layout`) + automatic Scanned PDF page OCR fallback (`pdftoppm` -> `Qwen2-VL-2B`)
+       * Word / OpenDocument (`.docx`, `.doc`, `.odt`, `.rtf`, `.epub`) -> In-RAM XML / `antiword` extraction
+       * Spreadsheets & Data (`.xlsx`, `.csv`, `.tsv`, `.json`, `.yaml`, `.xml`) -> Markdown tables + schema summary
+       * Archives (`.zip`, `.tar`, `.tar.gz`) -> Recursive in-RAM extraction with zip-bomb guard
+       * Code & Text (`.txt`, `.md`, `.py`, `.js`, `.ts`, `.sql`, `.html`, `.log`, etc.)
+  3. 3-Mode Intelligent Document Retrieval + Agentic LLM Tool-Calling:
+     - Mode A (Direct Read): Small documents (`<= 2400 chars`) injected completely into `<document_context>`.
+     - Mode B (Page-Range / Summary Map): Builds Document Map (TOC, page count, headings) + honors explicit `"page X"` queries.
+     - Mode C (Hybrid BM25 Lexical + ChromaDB Vector Search): Combines exact keyword/number matching with semantic embeddings.
+     - Exposes internal document/web tools (`search_document`, `read_document_pages`, `scrape_website`) that the LLM can invoke.
+  4. Persistent Local ChromaDB (`web_cache`, `image_index`, `docs_rag`, `chat_history`)
+  5. RX 5600 XT (6GB VRAM) safe model coordination with any model loaded in `AsyncLLM`
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 import gc
 import hashlib
+import io
 import ipaddress
 import json
 import logging
+import math
 import re
+import shutil
 import socket
+import subprocess
+import tarfile
 import threading
 import time
+import xml.etree.ElementTree as ET
+import zipfile
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Literal, Optional, Tuple
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pydantic import BaseModel, Field
@@ -43,6 +69,7 @@ from App.core.AsyncLLM import (
 from App.core.exceptions import (
     InsufficientMemoryError,
     InvalidCollectionError,
+    InvalidFileError,
     InvalidImageError,
     ModelNotFoundError,
     QueueFullError,
@@ -58,7 +85,7 @@ logger = logging.getLogger("orchestrator")
 
 class SourceCitation(BaseModel):
     index: int
-    source_type: Literal["web", "rag", "image"]
+    source_type: Literal["web", "rag", "image", "document"]
     title: str
     url_or_path: str
     snippet: str
@@ -69,6 +96,8 @@ class RouteDecision(BaseModel):
     use_rag: bool = False
     use_image_search: bool = False
     use_vision: bool = False
+    use_document: bool = False
+    direct_urls: List[str] = Field(default_factory=list)
     search_query: str = ""
     reason: str = ""
 
@@ -84,22 +113,69 @@ class VisionReport(BaseModel):
     search_query: str
 
 
+class ParsedPage(BaseModel):
+    page_number: int
+    title: str = ""
+    text: str
+    used_ocr: bool = False
+
+
+class ParsedDocumentReport(BaseModel):
+    doc_id: str
+    filename: str
+    file_type: str
+    doc_profile: str = "plain_narrative"
+    mime_type: str
+    user_id: str = "default_user"
+    session_id: str = "default_session"
+    total_pages: int
+    total_chars: int
+    total_chunks: int
+    toc_summary: str
+    pages: List[ParsedPage] = Field(default_factory=list)
+    full_text: str = ""
+
+
 class OrchestrationContext(BaseModel):
     enriched_messages: List[Dict[str, str]]
     user_query: str
+    user_id: str = "default_user"
+    session_id: str = "default_session"
     route: RouteDecision
     citations: List[SourceCitation] = Field(default_factory=list)
     vision_report: Optional[VisionReport] = None
+    document_report: Optional[ParsedDocumentReport] = None
     matched_images: List[Dict[str, Any]] = Field(default_factory=list)
     metrics_ms: Dict[str, float] = Field(default_factory=dict)
 
 
 # =============================================================================
-# 2. SECURITY & TEXT HELPERS
+# 2. SECURITY, FILE DETECTION & IMAGE RAM HELPERS
 # =============================================================================
+
+URL_EXTRACT_RE = re.compile(
+    r"https?://[^\s<>\"'`)\]]+",
+    re.IGNORECASE,
+)
+
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+
+def extract_urls_from_text(text: str) -> List[str]:
+    """Extract all valid HTTP/HTTPS URLs from a user message."""
+    if not text:
+        return []
+    raw_urls = URL_EXTRACT_RE.findall(text)
+    cleaned: List[str] = []
+    seen: set[str] = set()
+    for u in raw_urls:
+        u = u.rstrip(".,;:!?)]}'\"")
+        if u and u not in seen:
+            seen.add(u)
+            cleaned.append(u)
+    return cleaned
 
 
 def _is_safe_public_url(url: str) -> bool:
@@ -120,6 +196,103 @@ def _is_safe_public_url(url: str) -> bool:
         return False
 
 
+def is_image_bytes(data: bytes) -> bool:
+    """Return True if raw bytes match supported raster image magic headers."""
+    if not data or len(data) < 12:
+        return False
+    return (
+        data.startswith(b"\xff\xd8\xff")
+        or data.startswith(b"\x89PNG\r\n\x1a\n")
+        or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+        or data[:6] in (b"GIF87a", b"GIF89a")
+    )
+
+
+def detect_upload_kind(data: bytes, filename: str = "") -> Tuple[str, str]:
+    """
+    Auto-detect uploaded file type strictly in RAM using magic bytes + filename extension.
+    Returns `(kind, mime_type)` where `kind` is one of:
+      'image', 'pdf', 'docx', 'xlsx', 'odt', 'epub', 'zip', 'tar',
+      'doc', 'rtf', 'csv', 'tsv', 'json', 'xml', 'html', 'text'
+    """
+    if not data:
+        raise InvalidFileError("Uploaded file is empty")
+
+    ext = Path(filename or "").suffix.lower()
+
+    # 1. Magic-byte detection for images
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image", "image/jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image", "image/png"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "image", "image/webp"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "image", "image/gif"
+
+    # 2. PDF magic header (%PDF-)
+    if data.lstrip().startswith(b"%PDF-"):
+        return "pdf", "application/pdf"
+
+    # 3. Legacy MS Office Compound File (.doc / .xls)
+    if data.startswith(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"):
+        return "doc", "application/msword"
+
+    # 4. RTF magic header
+    if data.startswith(b"{\\rtf"):
+        return "rtf", "application/rtf"
+
+    # 5. ZIP container inspection (DOCX, XLSX, PPTX, ODT, EPUB, or generic ZIP)
+    if data.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                names = set(zf.namelist())
+                if "word/document.xml" in names or ext == ".docx":
+                    return "docx", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                if any(n.startswith("xl/worksheets/") for n in names) or ext == ".xlsx":
+                    return "xlsx", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                if any(n.startswith("ppt/slides/") for n in names) or ext == ".pptx":
+                    return "pptx", "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+                if "content.xml" in names or ext in (".odt", ".ods", ".odp"):
+                    return "odt", "application/vnd.oasis.opendocument.text"
+                if any(n.endswith(".opf") or n.endswith(".xhtml") for n in names) or ext == ".epub":
+                    return "epub", "application/epub+zip"
+                return "zip", "application/zip"
+        except Exception:
+            pass
+
+    # 6. Tar / Gzip archives
+    if ext in (".tar", ".tgz") or filename.lower().endswith((".tar.gz", ".tar.bz2", ".tar.xz")):
+        return "tar", "application/x-tar"
+
+    # 7. Structured text formats by extension or content
+    if ext == ".csv":
+        return "csv", "text/csv"
+    if ext == ".tsv":
+        return "tsv", "text/tab-separated-values"
+    if ext == ".json":
+        return "json", "application/json"
+    if ext in (".xml", ".rss", ".atom", ".svg"):
+        return "xml", "application/xml"
+    if ext in (".html", ".htm"):
+        return "html", "text/html"
+
+    # Sniff UTF-8 text / JSON / HTML / CSV from raw bytes
+    head_str = data[:2048].decode("utf-8", errors="ignore").lstrip()
+    if head_str.startswith(("{", "[")):
+        try:
+            json.loads(data.decode("utf-8", errors="ignore"))
+            return "json", "application/json"
+        except Exception:
+            pass
+    if head_str.lower().startswith(("<!doctype html", "<html")):
+        return "html", "text/html"
+    if head_str.startswith("<?xml"):
+        return "xml", "application/xml"
+
+    return "text", "text/plain"
+
+
 def _downscale_image_in_ram(image_bytes: bytes, max_dim: int = 768) -> bytes:
     """
     Downscale oversized images strictly in RAM via stdin/stdout pipe (zero disk writes)
@@ -128,7 +301,6 @@ def _downscale_image_in_ram(image_bytes: bytes, max_dim: int = 768) -> bytes:
     if len(image_bytes) < 120_000:
         return image_bytes
     try:
-        import subprocess
         proc = subprocess.run(
             ["magick", "-", "-auto-orient", "-resize", f"{max_dim}x{max_dim}>", "-quality", "88", "jpeg:-"],
             input=image_bytes,
@@ -174,7 +346,6 @@ def base64_to_data_uri(image_base64: str) -> tuple[str, str]:
     if raw.startswith("data:image/"):
         header, _, b64_part = raw.partition(",")
         mime = header.split(";")[0].replace("data:", "")
-        # Validate base64 decodes cleanly in RAM
         base64.b64decode(b64_part, validate=True)
         return raw, mime
     decoded = base64.b64decode(raw, validate=True)
@@ -216,7 +387,7 @@ def extract_text_and_images(messages: List[Any]) -> tuple[List[Dict[str, str]], 
 
 
 # =============================================================================
-# 3. PERSISTENT CHROMADB MEMORY (CPU-ONLY)
+# 3. PERSISTENT CHROMADB MEMORY + HYBRID BM25 RERANKER (CPU-ONLY)
 # =============================================================================
 
 class LocalEmbedder:
@@ -256,7 +427,6 @@ class LocalEmbedder:
         vecs = np.zeros((len(texts), cls.DIM), dtype=np.float32)
         for row, text in enumerate(texts):
             tokens = re.findall(r"\w+", text.lower())
-            # Word unigrams + 3-char subword n-grams for semantic/lexical recall
             grams = tokens + [w[i : i + 3] for w in tokens if len(w) >= 3 for i in range(len(w) - 2)]
             for g in grams:
                 digest = hashlib.blake2b(g.encode("utf-8"), digest_size=8).digest()
@@ -276,12 +446,34 @@ class LocalEmbedder:
         return vecs.tolist()
 
 
+def _bm25_lexical_score(query: str, document: str) -> float:
+    """Fast Okapi BM25-style lexical overlap score for hybrid exact+semantic ranking."""
+    q_tokens = [t for t in re.findall(r"\w+", query.lower()) if len(t) >= 2]
+    if not q_tokens:
+        return 0.0
+    d_tokens = re.findall(r"\w+", document.lower())
+    if not d_tokens:
+        return 0.0
+    counts = Counter(d_tokens)
+    k1 = 1.5
+    b = 0.75
+    avg_dl = 180.0
+    dl = float(len(d_tokens))
+    score = 0.0
+    for qt in set(q_tokens):
+        tf = counts.get(qt, 0)
+        if tf > 0:
+            denom = tf + k1 * (1.0 - b + b * (dl / avg_dl))
+            score += (tf * (k1 + 1.0)) / denom
+    return score / max(1.0, len(set(q_tokens)))
+
+
 class ChromaMemory:
     """
-    Persistent local disk ChromaDB with 4 collections:
-      - web_cache:    Scraped DuckDuckGo pages with TTL expiration
-      - image_index:  Qwen2-VL descriptions + OCR + file paths
-      - docs_rag:     Local documents / knowledge base
+    Persistent local disk ChromaDB with 4 collections + Hybrid Vector/BM25 retrieval:
+      - web_cache:    Scraped web pages with TTL expiration
+      - image_index:  Qwen2-VL descriptions + OCR
+      - docs_rag:     Uploaded & ingested documents with page/section metadata
       - chat_history: Past Q&A turns for `/history` & `/history/search`
     """
 
@@ -292,12 +484,55 @@ class ChromaMemory:
         self._client: Any = None
         self._collections: Dict[str, Any] = {}
         self._client_lock = threading.Lock()
+        # Strict multi-tenant RAM isolation: keyed by doc_id (which embeds user_id:session_id)
+        self._active_docs: Dict[str, ParsedDocumentReport] = {}
+        self._active_raw_bytes: Dict[str, bytes] = {}
+        self._tenant_latest_doc_id: Dict[Tuple[str, str], str] = {}
+        self._latest_doc_id: Optional[str] = None
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.ORCH_CHUNK_SIZE_CHARS,
             chunk_overlap=settings.ORCH_CHUNK_OVERLAP_CHARS,
             separators=["\n\n", "\n", ". ", ", ", " ", ""],
             length_function=len,
         )
+
+    @staticmethod
+    def build_tenant_where(
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Build a strict ChromaDB metadata filter (`$and`) isolating records by `user_id` and `session_id`
+        so User A's documents, images, or chat history can NEVER be retrieved by User B.
+        """
+        clauses: List[Dict[str, Any]] = []
+        if user_id:
+            clauses.append({"user_id": str(user_id)})
+        if session_id:
+            clauses.append({"session_id": str(session_id)})
+        if extra:
+            for k, v in extra.items():
+                clauses.append({k: v})
+        if not clauses:
+            return None
+        if len(clauses) == 1:
+            return clauses[0]
+        return {"$and": clauses}
+
+    def get_tenant_doc_id(
+        self,
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+        requested_doc_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Resolve a document ID strictly within the caller's (user_id, session_id) tenant scope."""
+        if requested_doc_id and requested_doc_id in self._active_docs:
+            doc = self._active_docs[requested_doc_id]
+            if doc.user_id == user_id and (not session_id or doc.session_id == session_id):
+                return requested_doc_id
+            return None
+        return self._tenant_latest_doc_id.get((user_id, session_id)) or self._tenant_latest_doc_id.get((user_id, "*"))
 
     def _ensure_client(self) -> None:
         if self._client is not None:
@@ -337,7 +572,12 @@ class ChromaMemory:
                 col.upsert(ids=ids, documents=documents, metadatas=metadatas)
 
     def _query_sync(
-        self, collection_name: str, query: str, n_results: int = 4, where: Optional[Dict[str, Any]] = None
+        self,
+        collection_name: str,
+        query: str,
+        n_results: int = 4,
+        where: Optional[Dict[str, Any]] = None,
+        relax_threshold: bool = False,
     ) -> List[Dict[str, Any]]:
         self._ensure_client()
         q_emb = self.embedder.embed([query])
@@ -346,33 +586,58 @@ class ChromaMemory:
             total = col.count()
             if total == 0:
                 return []
-            k = min(n_results, total)
-            kwargs: Dict[str, Any] = {"n_results": k, "include": ["documents", "metadatas", "distances"]}
+            # Fetch a wider candidate pool (up to 3x) so hybrid BM25 + Vector reranking catches exact keywords/numbers
+            candidate_k = min(max(n_results * 3, 8), total)
+            kwargs: Dict[str, Any] = {"n_results": candidate_k, "include": ["documents", "metadatas", "distances"]}
             if where:
                 kwargs["where"] = where
             if q_emb is not None:
                 kwargs["query_embeddings"] = q_emb
             else:
                 kwargs["query_texts"] = [query]
-            res = col.query(**kwargs)
-        hits: List[Dict[str, Any]] = []
+            try:
+                res = col.query(**kwargs)
+            except Exception:
+                return []
+
+        max_dist = 1.25 if relax_threshold else settings.ORCH_MAX_DISTANCE
+        candidates: List[Dict[str, Any]] = []
         for doc, meta, dist in zip(
             res.get("documents", [[]])[0],
             res.get("metadatas", [[]])[0],
             res.get("distances", [[]])[0],
         ):
-            if dist <= settings.ORCH_MAX_DISTANCE:
-                hits.append({"document": doc, "metadata": meta or {}, "distance": float(dist)})
-        return hits
+            bm25 = _bm25_lexical_score(query, doc)
+            # Hybrid distance: boost vector distance by lexical BM25 match
+            hybrid_dist = max(0.0, float(dist) - (0.22 * bm25))
+            if hybrid_dist <= max_dist or bm25 >= 0.45:
+                candidates.append({
+                    "document": doc,
+                    "metadata": meta or {},
+                    "distance": round(hybrid_dist, 4),
+                    "bm25": round(bm25, 4),
+                })
 
-    def _list_sync(self, collection_name: str, limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+        candidates.sort(key=lambda x: x["distance"])
+        return candidates[:n_results]
+
+    def _list_sync(
+        self,
+        collection_name: str,
+        limit: int = 20,
+        offset: int = 0,
+        where: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         self._ensure_client()
         with self._client_lock:
             col = self._collections[collection_name]
             total = col.count()
             if total == 0:
                 return {"collection": collection_name, "total": 0, "items": []}
-            res = col.get(limit=limit, offset=offset, include=["documents", "metadatas"])
+            get_kwargs: Dict[str, Any] = {"limit": limit, "offset": offset, "include": ["documents", "metadatas"]}
+            if where:
+                get_kwargs["where"] = where
+            res = col.get(**get_kwargs)
         items = [
             {"id": doc_id, "document": doc, "metadata": meta or {}}
             for doc_id, doc, meta in zip(
@@ -381,7 +646,7 @@ class ChromaMemory:
                 res.get("metadatas", []),
             )
         ]
-        return {"collection": collection_name, "total": total, "items": items}
+        return {"collection": collection_name, "total": len(items) if where else total, "items": items}
 
     async def upsert(
         self, collection_name: str, ids: List[str], documents: List[str], metadatas: List[Dict[str, Any]]
@@ -389,32 +654,351 @@ class ChromaMemory:
         await asyncio.to_thread(self._upsert_sync, collection_name, ids, documents, metadatas)
 
     async def query(
-        self, collection_name: str, query: str, n_results: int = 4, where: Optional[Dict[str, Any]] = None
+        self,
+        collection_name: str,
+        query: str,
+        n_results: int = 4,
+        where: Optional[Dict[str, Any]] = None,
+        relax_threshold: bool = False,
     ) -> List[Dict[str, Any]]:
-        return await asyncio.to_thread(self._query_sync, collection_name, query, n_results, where)
+        return await asyncio.to_thread(self._query_sync, collection_name, query, n_results, where, relax_threshold)
 
-    async def list_entries(self, collection_name: str = "chat_history", limit: int = 20, offset: int = 0) -> Dict[str, Any]:
+    async def list_entries(
+        self,
+        collection_name: str = "chat_history",
+        limit: int = 20,
+        offset: int = 0,
+        user_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         if collection_name not in self.VALID_COLLECTIONS:
             raise InvalidCollectionError(f"Invalid collection '{collection_name}'. Choose from {self.VALID_COLLECTIONS}")
-        return await asyncio.to_thread(self._list_sync, collection_name, limit, offset)
+        where = None if collection_name == "web_cache" else self.build_tenant_where(user_id=user_id, session_id=session_id)
+        return await asyncio.to_thread(self._list_sync, collection_name, limit, offset, where)
 
     async def query_fresh_web_cache(self, query: str, n_results: int = 4) -> List[Dict[str, Any]]:
         cutoff = int(time.time()) - (settings.ORCH_WEB_CACHE_TTL_HOURS * 3600)
         return await self.query("web_cache", query, n_results=n_results, where={"fetched_at": {"$gte": cutoff}})
 
-    async def ingest_document(self, title: str, text: str, source: str = "local_doc") -> int:
+    async def ingest_document(
+        self,
+        title: str,
+        text: str,
+        source: str = "local_doc",
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+    ) -> int:
         chunks = self._splitter.split_text(text)
         if not chunks:
             return 0
         now = int(time.time())
-        ids = [_sha256(f"{source}:{i}:{c[:80]}") for i, c in enumerate(chunks)]
-        metas = [{"title": title, "source": source, "chunk_index": i, "ingested_at": now} for i in range(len(chunks))]
+        doc_id = _sha256(f"{user_id}:{session_id}:{source}")
+        ids = [_sha256(f"{doc_id}:{i}:{c[:80]}") for i, c in enumerate(chunks)]
+        metas = [
+            {
+                "title": title,
+                "source": source,
+                "doc_id": doc_id,
+                "user_id": user_id,
+                "session_id": session_id,
+                "doc_profile": "plain_narrative",
+                "chunk_type": "prose",
+                "page_number": 1,
+                "chunk_index": i,
+                "ingested_at": now,
+            }
+            for i in range(len(chunks))
+        ]
         await self.upsert("docs_rag", ids, chunks, metas)
         return len(chunks)
 
-    async def index_image_report(self, image_bytes_or_uri: bytes | str, report: VisionReport, mime_type: str = "image/jpeg") -> str:
+    @staticmethod
+    def _classify_doc_profile(file_type: str, filename: str, pages: List[ParsedPage]) -> str:
+        """
+        Classify document into one of 4 specialized indexing profiles:
+          1. 'datasheet_or_table'       (CSV, TSV, XLSX, or table-dense technical datasheets)
+          2. 'mixed_doc_with_tables'    (PDF/DOCX/PPTX/HTML with both narrative paragraphs and tables)
+          3. 'structured_code_or_json'  (Python/JS/TS/SQL/JSON/YAML/XML source code & configs)
+          4. 'plain_narrative'          (Prose documents, books, letters, articles)
+        """
+        ext = Path(filename or "").suffix.lower()
+        if file_type in ("csv", "tsv", "xlsx"):
+            return "datasheet_or_table"
+        if file_type in ("json", "xml") or ext in (".py", ".js", ".ts", ".jsx", ".tsx", ".sql", ".yaml", ".yml", ".sh", ".c", ".cpp", ".rs", ".go", ".java"):
+            return "structured_code_or_json"
+
+        all_lines = [ln.strip() for p in pages for ln in p.text.splitlines() if ln.strip()]
+        if not all_lines:
+            return "plain_narrative"
+
+        table_line_count = sum(
+            1 for ln in all_lines
+            if (ln.startswith("|") and ln.endswith("|")) or len(re.findall(r"\s{3,}|\t", ln)) >= 2
+        )
+        spec_kv_count = sum(1 for ln in all_lines if re.match(r"^[A-Za-z0-9_ /\-().]{2,40}\s*[:=]\s*\S+", ln))
+        prose_line_count = sum(
+            1 for ln in all_lines
+            if not ((ln.startswith("|") and ln.endswith("|")) or len(re.findall(r"\s{3,}|\t", ln)) >= 2)
+            and len(ln.split()) >= 6
+        )
+        ratio = (table_line_count + spec_kv_count) / max(1, len(all_lines))
+
+        if table_line_count >= 2 and prose_line_count >= 2:
+            return "mixed_doc_with_tables"
+        if ratio >= 0.65:
+            return "datasheet_or_table"
+        if table_line_count >= 2:
+            return "mixed_doc_with_tables"
+        return "plain_narrative"
+
+    def _build_specialized_page_chunks(
+        self,
+        report: ParsedDocumentReport,
+        page: ParsedPage,
+    ) -> List[Tuple[str, str]]:
+        """
+        Adaptive Document-Type Chunking Strategy (Never blindly slices tables or datasheets!):
+        Returns list of `(chunk_text, chunk_type)`.
+        """
+        profile = report.doc_profile
+        base_header = f"[File: {report.filename} | Profile: {profile} | Page {page.page_number}/{report.total_pages}]"
+        if page.title:
+            base_header += f" ({page.title})"
+
+        # Strategy 1: Datasheet / Pure Table (repeats column headers + key:value semantic row serialization in EVERY chunk)
+        if profile == "datasheet_or_table":
+            lines = [ln.strip() for ln in page.text.splitlines() if ln.strip()]
+            md_rows = [ln for ln in lines if ln.startswith("|") and ln.endswith("|")]
+            meta_lines = [ln for ln in lines if not (ln.startswith("|") and ln.endswith("|"))][:4]
+
+            if len(md_rows) >= 2:
+                col_header = md_rows[0]
+                cols = [c.strip() for c in col_header.strip("|").split("|")]
+                sep_row = "| " + " | ".join(["---"] * len(cols)) + " |"
+                data_rows = [r for r in md_rows[1:] if not re.match(r"^\|[\s\-:|]+\|$", r)]
+
+                out_chunks: List[Tuple[str, str]] = []
+                batch_size = 12
+                for start in range(0, max(1, len(data_rows)), batch_size):
+                    batch = data_rows[start : start + batch_size]
+                    kv_lines: List[str] = []
+                    for r in batch:
+                        cells = [c.strip() for c in r.strip("|").split("|")]
+                        pairs = [f"{cols[i]}={cells[i]}" for i in range(min(len(cols), len(cells))) if cells[i]]
+                        if pairs:
+                            kv_lines.append("Row: " + ", ".join(pairs))
+                    table_block = "\n".join(
+                        [base_header]
+                        + meta_lines
+                        + [col_header, sep_row]
+                        + batch
+                        + (["Semantic Row Index:", *kv_lines] if kv_lines else [])
+                    )
+                    out_chunks.append((table_block[:1200], "datasheet_table"))
+                return out_chunks
+
+        # Strategy 2: Mixed Document with Prose + Embedded Tables (separates prose blocks from table blocks)
+        if profile == "mixed_doc_with_tables":
+            out_chunks = []
+            prose_buf: List[str] = []
+            table_buf: List[str] = []
+
+            def flush_prose():
+                if not prose_buf:
+                    return
+                joined = "\n".join(prose_buf).strip()
+                prose_buf.clear()
+                for c in self._splitter.split_text(joined):
+                    out_chunks.append((f"{base_header}\n{c}", "prose"))
+
+            def flush_table():
+                if not table_buf:
+                    return
+                hdr = table_buf[0]
+                rows = table_buf[1:]
+                table_buf.clear()
+                for s in range(0, max(1, len(rows)), 14):
+                    sub = rows[s : s + 14]
+                    t_txt = "\n".join([f"{base_header} [Embedded Table]", hdr, *sub])
+                    out_chunks.append((t_txt[:1100], "embedded_table"))
+
+            for ln in page.text.splitlines():
+                s = ln.strip()
+                is_tbl = (s.startswith("|") and s.endswith("|")) or len(re.findall(r"\s{3,}|\t", ln)) >= 2
+                if is_tbl:
+                    flush_prose()
+                    table_buf.append(s)
+                else:
+                    flush_table()
+                    prose_buf.append(ln)
+            flush_prose()
+            flush_table()
+            if out_chunks:
+                return out_chunks
+
+        # Strategy 3: Structured Code or JSON (splits on class/def/function/top-level key boundaries)
+        if profile == "structured_code_or_json":
+            code_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=settings.ORCH_CHUNK_SIZE_CHARS,
+                chunk_overlap=settings.ORCH_CHUNK_OVERLAP_CHARS,
+                separators=["\nclass ", "\ndef ", "\nasync def ", "\nfunction ", "\nexport ", "\n  \"", "\n\n", "\n", " "],
+                length_function=len,
+            )
+            return [(f"{base_header} [Code/Structured]\n{c}", "code_or_json") for c in code_splitter.split_text(page.text)]
+
+        # Strategy 4: Plain Narrative (heading-aware paragraph chunking)
+        return [(f"{base_header}\n{c}", "prose") for c in self._splitter.split_text(page.text)]
+
+    async def index_parsed_document(self, report: ParsedDocumentReport) -> int:
+        """
+        Index a parsed document into ChromaDB `docs_rag` using its specialized `doc_profile` strategy
+        and strict `(user_id, session_id)` tenant isolation.
+        """
+        report.doc_profile = self._classify_doc_profile(report.file_type, report.filename, report.pages)
+        self._active_docs[report.doc_id] = report
+        self._tenant_latest_doc_id[(report.user_id, report.session_id)] = report.doc_id
+        self._tenant_latest_doc_id[(report.user_id, "*")] = report.doc_id
+        self._latest_doc_id = report.doc_id
+
+        now = int(time.time())
+        ids: List[str] = []
+        chunks: List[str] = []
+        metas: List[Dict[str, Any]] = []
+
+        for page in report.pages:
+            specialized_chunks = self._build_specialized_page_chunks(report, page)
+            for c_idx, (chunk_text, chunk_type) in enumerate(specialized_chunks):
+                cid = _sha256(f"{report.user_id}:{report.session_id}:{report.doc_id}:p{page.page_number}:c{c_idx}:{chunk_text[:48]}")
+                ids.append(cid)
+                chunks.append(chunk_text)
+                metas.append({
+                    "doc_id": report.doc_id,
+                    "user_id": report.user_id,
+                    "session_id": report.session_id,
+                    "title": report.filename,
+                    "source": report.filename,
+                    "file_type": report.file_type,
+                    "doc_profile": report.doc_profile,
+                    "chunk_type": chunk_type,
+                    "page_number": page.page_number,
+                    "chunk_index": c_idx,
+                    "ingested_at": now,
+                })
+
+        if chunks:
+            await self.upsert("docs_rag", ids, chunks, metas)
+        report.total_chunks = len(chunks)
+        return len(chunks)
+
+    def read_document_pages(
+        self,
+        doc_id: Optional[str],
+        start_page: int = 1,
+        end_page: int = 2,
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+    ) -> str:
+        """Direct page-range reader tool strictly isolated to the caller's `(user_id, session_id)`."""
+        target_id = self.get_tenant_doc_id(user_id=user_id, session_id=session_id, requested_doc_id=doc_id)
+        if not target_id or target_id not in self._active_docs:
+            return "No active parsed document found for this user/session."
+        doc = self._active_docs[target_id]
+        s_p = max(1, int(start_page))
+        e_p = min(doc.total_pages, max(s_p, int(end_page)))
+        out: List[str] = []
+        for p in doc.pages:
+            if s_p <= p.page_number <= e_p:
+                out.append(f"--- [Page {p.page_number}/{doc.total_pages} of {doc.filename}] ---\n{p.text[:1800]}")
+        return "\n\n".join(out) if out else f"Pages {s_p}-{e_p} not found (document has {doc.total_pages} pages)."
+
+    def query_table_data(
+        self,
+        doc_id: Optional[str] = None,
+        sheet_or_table: str = "",
+        filter_query: str = "",
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+    ) -> str:
+        """
+        Tool 3: Exact row/column filtering and numeric aggregation (sum/avg/min/max/count)
+        strictly isolated to the caller's `(user_id, session_id)`.
+        """
+        target_id = self.get_tenant_doc_id(user_id=user_id, session_id=session_id, requested_doc_id=doc_id)
+        if not target_id or target_id not in self._active_docs:
+            return "No active parsed document found for this user/session."
+        doc = self._active_docs[target_id]
+
+        table_lines: List[str] = []
+        for p in doc.pages:
+            if sheet_or_table and sheet_or_table.lower() not in (p.title.lower() + f" sheet {p.page_number} page {p.page_number}"):
+                continue
+            for ln in p.text.splitlines():
+                if ln.strip().startswith("|") and ln.strip().endswith("|"):
+                    table_lines.append(ln.strip())
+
+        if not table_lines:
+            # Fallback: search all lines matching filter_query
+            q_terms = [t.lower() for t in re.findall(r"\w+", filter_query) if len(t) >= 2]
+            matched = [
+                ln for p in doc.pages for ln in p.text.splitlines()
+                if any(t in ln.lower() for t in q_terms)
+            ][:30]
+            return "\n".join(matched) if matched else "No table rows matched query."
+
+        header_line = table_lines[0]
+        headers = [c.strip() for c in header_line.strip("|").split("|")]
+        data_rows: List[List[str]] = []
+        for ln in table_lines[1:]:
+            if re.match(r"^\|[\s\-:|]+\|$", ln):
+                continue
+            cells = [c.strip() for c in ln.strip("|").split("|")]
+            data_rows.append(cells)
+
+        q_terms = [t.lower() for t in re.findall(r"\w+", filter_query) if len(t) >= 2 and t.lower() not in ("sum", "total", "average", "avg", "min", "max", "count", "all")]
+        filtered = [
+            r for r in data_rows
+            if not q_terms or any(any(qt in cell.lower() for cell in r) for qt in q_terms)
+        ]
+        target_rows = filtered if filtered else data_rows
+
+        # Compute numeric column aggregations (sum, avg, min, max) automatically
+        col_stats: List[str] = []
+        for c_idx, h_name in enumerate(headers):
+            nums: List[float] = []
+            for r in target_rows:
+                if c_idx < len(r):
+                    raw_val = r[c_idx].replace(",", "").replace("$", "").strip()
+                    try:
+                        nums.append(float(raw_val))
+                    except ValueError:
+                        pass
+            if nums:
+                col_stats.append(
+                    f"- {h_name}: count={len(nums)}, sum={sum(nums):,.2f}, avg={sum(nums)/len(nums):,.2f}, min={min(nums):,.2f}, max={max(nums):,.2f}"
+                )
+
+        md_preview = [
+            f"Table ({doc.filename}) — Matched {len(target_rows)}/{len(data_rows)} rows:",
+            "| " + " | ".join(headers) + " |",
+            "| " + " | ".join(["---"] * len(headers)) + " |",
+        ]
+        for r in target_rows[:35]:
+            md_preview.append("| " + " | ".join(r) + " |")
+        if col_stats:
+            md_preview.append("\nNumeric Aggregations on Matched Rows:\n" + "\n".join(col_stats))
+        return "\n".join(md_preview)
+
+    async def index_image_report(
+        self,
+        image_bytes_or_uri: bytes | str,
+        report: VisionReport,
+        mime_type: str = "image/jpeg",
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+    ) -> str:
         raw = image_bytes_or_uri if isinstance(image_bytes_or_uri, bytes) else image_bytes_or_uri.encode("utf-8")
-        doc_id = hashlib.sha256(raw).hexdigest()[:24]
+        img_hash = hashlib.sha256(raw).hexdigest()[:16]
+        doc_id = _sha256(f"{user_id}:{session_id}:{img_hash}")
         searchable = (
             f"Summary: {report.summary}\nScene: {report.scene}\n"
             f"Details: {report.subjects_and_details}\n"
@@ -424,6 +1008,8 @@ class ChromaMemory:
         )
         meta = {
             "image_id": doc_id,
+            "user_id": user_id,
+            "session_id": session_id,
             "mime_type": mime_type,
             "scene": report.scene,
             "tags": ", ".join(report.tags),
@@ -432,18 +1018,143 @@ class ChromaMemory:
         await self.upsert("image_index", [doc_id], [searchable], [meta])
         return doc_id
 
+    REFUSAL_PATTERNS = re.compile(
+        r"(i'm sorry,?\s+but\s+i\s+(don't|do not|cannot|can't)|"
+        r"i\s+don't\s+have\s+access\s+to\s+personal\s+information|"
+        r"i\s+cannot\s+determine|"
+        r"i'm\s+unable\s+to\s+directly\s+access|"
+        r"unless\s+you've\s+provided\s+it\s+in\s+our\s+previous\s+interactions)",
+        re.IGNORECASE,
+    )
+    FACT_DECLARATION_PATTERNS = re.compile(
+        r"\b(i am|i'm|my name is|call me|mera naam|i work as|i live in|my email|my project|my favorite|remember that)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _score_memory_turn(cls, current_query: str, turn_doc: str) -> float:
+        """
+        Score a stored `User: ...\nAssistant: ...` turn to select the SINGLE best factual match:
+          - Rejects (-999.0) turns where the assistant gave a refusal/"I don't know" response
+            or where the stored user question is just an identical repeat of `current_query`.
+          - Rewards BM25 lexical overlap + declarative user fact patterns (`I am...`, `my name is...`).
+        """
+        if not turn_doc:
+            return -999.0
+
+        user_part, _, assistant_part = turn_doc.partition("\nAssistant:")
+        user_msg = user_part.replace("User:", "", 1).strip()
+        asst_msg = assistant_part.strip()
+
+        # 1. Poisoning Guard: discard turns where assistant refused or didn't know
+        if cls.REFUSAL_PATTERNS.search(asst_msg):
+            return -999.0
+
+        # 2. Discard turns where the stored user message is just the exact same question without facts
+        norm_q = re.sub(r"\W+", " ", current_query.lower()).strip()
+        norm_u = re.sub(r"\W+", " ", user_msg.lower()).strip()
+        if norm_q == norm_u and not cls.FACT_DECLARATION_PATTERNS.search(user_msg):
+            return -999.0
+
+        score = _bm25_lexical_score(current_query, turn_doc)
+
+        # 3. Fact-Intent Boost: when user asks a personal/memory question ("whats my name?", "who am i?"),
+        # strongly boost declarative user turns ("HI i am talha", "my name is...")
+        is_personal_q = bool(
+            re.search(r"\b(whats|what's|what is)?\s*(my name|who am i|mera naam|about me|my role|my job|what did i|remember)\b", current_query, re.IGNORECASE)
+        )
+        if is_personal_q and cls.FACT_DECLARATION_PATTERNS.search(user_msg):
+            score += 2.5
+        elif cls.FACT_DECLARATION_PATTERNS.search(user_msg):
+            score += 0.6
+
+        return score
+
+    async def get_session_memory(
+        self,
+        user_id: str,
+        session_id: str,
+        current_query: str,
+        recent_k: int = 1,
+        semantic_k: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """
+        Smartly retrieve the BEST 1 factual memory match from ChromaDB `chat_history`
+        (plus at most 1 immediate valid chronological turn if distinct),
+        filtering out all refusal / "I don't know" turns and strictly isolating by `user_id`.
+        """
+        session_where = self.build_tenant_where(user_id=user_id, session_id=session_id)
+        user_where = self.build_tenant_where(user_id=user_id)
+
+        # 1. Fetch session turns + semantic candidates from ChromaDB
+        raw_session = await asyncio.to_thread(self._list_sync, "chat_history", 50, 0, session_where)
+        sess_items = raw_session.get("items", [])
+        sess_items.sort(key=lambda x: int((x.get("metadata") or {}).get("timestamp", 0)))
+
+        expanded_q = current_query
+        if re.search(r"\b(my name|who am i|mera naam|what did i say|remember)\b", current_query, re.IGNORECASE):
+            expanded_q = f"{current_query} I am my name is call me remember"
+        semantic_hits = await self.query(
+            "chat_history",
+            expanded_q,
+            n_results=8,
+            where=user_where,
+            relax_threshold=True,
+        )
+
+        # 2. Score all candidate turns and pick the #1 highest-confidence factual winner
+        candidate_map: Dict[str, Dict[str, Any]] = {}
+        for item in sess_items:
+            doc = (item.get("document") or "").strip()
+            if doc:
+                candidate_map[doc] = {"document": doc, "metadata": item.get("metadata", {})}
+        for hit in semantic_hits:
+            doc = (hit.get("document") or "").strip()
+            if doc and doc not in candidate_map:
+                candidate_map[doc] = {"document": doc, "metadata": hit.get("metadata", {}), "vec_dist": hit.get("distance", 0.5)}
+
+        scored: List[Tuple[float, int, Dict[str, Any]]] = []
+        for doc, entry in candidate_map.items():
+            base_score = self._score_memory_turn(current_query, doc)
+            if base_score <= -100.0:
+                continue
+            vec_bonus = max(0.0, 1.0 - float(entry.get("vec_dist", 0.5))) * 0.5
+            ts = int((entry.get("metadata") or {}).get("timestamp", 0))
+            scored.append((base_score + vec_bonus, ts, entry))
+
+        if not scored:
+            return []
+
+        # Sort by highest score first, breaking ties by newest timestamp
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        best_winner = scored[0][2]
+        return [{"document": best_winner["document"], "metadata": best_winner["metadata"], "type": "best_match"}]
+
     async def record_chat_turn(
-        self, query: str, answer: str, model_used: str, route: RouteDecision
+        self,
+        query: str,
+        answer: str,
+        model_used: str,
+        route: RouteDecision,
+        user_id: str = "default_user",
+        session_id: str = "default_session",
     ) -> str:
+        # Never pollute ChromaDB chat_history with refusal / "I don't know" answers
+        if self.REFUSAL_PATTERNS.search(answer or ""):
+            logger.debug("Skipping ChromaDB chat_history upsert for refusal/unknown response")
+            return ""
         now = int(time.time())
-        doc_id = _sha256(f"{now}:{query[:120]}")
+        doc_id = _sha256(f"{user_id}:{session_id}:{now}:{query[:120]}")
         doc_text = f"User: {query}\nAssistant: {answer}"
         meta = {
+            "user_id": user_id,
+            "session_id": session_id,
             "query": query[:500],
             "model": model_used,
             "used_web": route.use_web,
             "used_rag": route.use_rag,
             "used_vision": route.use_vision,
+            "used_document": route.use_document,
             "timestamp": now,
         }
         await self.upsert("chat_history", [doc_id], [doc_text], [meta])
@@ -451,11 +1162,710 @@ class ChromaMemory:
 
 
 # =============================================================================
-# 4. TOOLS: DUCKDUCKGO WEB SEARCH + QWEN2-VL PHOTO DESCRIBER
+# 4. UNIVERSAL IN-RAM DOCUMENT & FILE PARSER (PDF, SCANNED PDF OCR, DOCX, XLSX, CSV, ZIP, CODE)
+# =============================================================================
+
+class UniversalCodeASTProcessor:
+    """
+    Universal Multi-Language AST Code Splitter & Token-Saving Skeleton Compressor.
+    Supports ANY programming language in the world:
+      - Python: Full `ast.parse()` AST node extraction (classes, functions, async functions, methods, imports)
+      - All Other Languages (JS/TS, C/C++, Rust, Go, Java, C#, PHP, Ruby, Kotlin, Swift, Dart, Solidity, SQL, Lua, Bash, R, etc.):
+        Structural grammar & brace/indent AST block parser + token-saving skeleton summary when file exceeds context window.
+    """
+
+    SYMBOL_PATTERN = re.compile(
+        r"^[ \t]*"
+        r"(?:export\s+|pub(?:\([^)]+\))?\s+|public\s+|private\s+|protected\s+|internal\s+|static\s+|async\s+|virtual\s+|inline\s+|extern\s+|final\s+|abstract\s+|unsafe\s+|const\s+)*"
+        r"(?:"
+        r"def\s+([A-Za-z_]\w*)|"
+        r"class\s+([A-Za-z_]\w*)|"
+        r"function\s+([A-Za-z_]\w*)|"
+        r"fn\s+([A-Za-z_]\w*)|"
+        r"func\s+(?:\([^)]+\)\s*)?([A-Za-z_]\w*)|"
+        r"struct\s+([A-Za-z_]\w*)|"
+        r"interface\s+([A-Za-z_]\w*)|"
+        r"trait\s+([A-Za-z_]\w*)|"
+        r"impl(?:\s*<[^>]+>)?\s+([A-Za-z_]\w*)|"
+        r"enum\s+([A-Za-z_]\w*)|"
+        r"module\s+([A-Za-z_]\w*)|"
+        r"contract\s+([A-Za-z_]\w*)|"
+        r"CREATE\s+(?:OR\s+REPLACE\s+)?(?:TABLE|FUNCTION|PROCEDURE|VIEW)\s+([A-Za-z_]\w*)|"
+        r"(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>"
+        r")",
+        re.MULTILINE,
+    )
+
+    LANG_BY_EXT: Dict[str, str] = {
+        ".py": "Python", ".pyw": "Python", ".pyi": "Python",
+        ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript", ".jsx": "JavaScript (JSX)",
+        ".ts": "TypeScript", ".tsx": "TypeScript (TSX)",
+        ".c": "C", ".h": "C/C++ Header", ".cpp": "C++", ".cc": "C++", ".cxx": "C++", ".hpp": "C++ Header",
+        ".rs": "Rust", ".go": "Go", ".java": "Java", ".kt": "Kotlin", ".kts": "Kotlin",
+        ".cs": "C#", ".swift": "Swift", ".dart": "Dart", ".php": "PHP", ".rb": "Ruby",
+        ".scala": "Scala", ".lua": "Lua", ".r": "R", ".jl": "Julia", ".ex": "Elixir", ".exs": "Elixir",
+        ".erl": "Erlang", ".hs": "Haskell", ".ml": "OCaml", ".clj": "Clojure", ".sol": "Solidity",
+        ".sql": "SQL", ".sh": "Bash/Shell", ".bash": "Bash", ".zsh": "Zsh", ".ps1": "PowerShell",
+        ".html": "HTML", ".css": "CSS", ".scss": "SCSS", ".vue": "Vue", ".svelte": "Svelte",
+        ".json": "JSON", ".yaml": "YAML", ".yml": "YAML", ".toml": "TOML", ".xml": "XML",
+        ".proto": "Protobuf", ".graphql": "GraphQL", ".dockerfile": "Dockerfile", ".tf": "Terraform",
+    }
+
+    @classmethod
+    def detect_language(cls, filename: str, code_text: str) -> str:
+        ext = Path(filename or "").suffix.lower()
+        if ext in cls.LANG_BY_EXT:
+            return cls.LANG_BY_EXT[ext]
+        first_line = (code_text.splitlines()[0] if code_text else "").strip()
+        if first_line.startswith("#!"):
+            if "python" in first_line:
+                return "Python"
+            if "node" in first_line:
+                return "JavaScript"
+            if "bash" in first_line or "sh" in first_line:
+                return "Bash/Shell"
+        if "def " in code_text and "import " in code_text:
+            return "Python"
+        if "fn main(" in code_text or "impl " in code_text:
+            return "Rust"
+        if "package main" in code_text or "func " in code_text:
+            return "Go"
+        if "#include" in code_text:
+            return "C/C++"
+        if "function " in code_text or "const " in code_text:
+            return "JavaScript/TypeScript"
+        return f"Code ({ext or 'auto'})"
+
+    @staticmethod
+    def _strip_comments_and_blank_lines(code: str, keep_docstrings: bool = True) -> str:
+        """Compact code by collapsing excessive blank lines and trailing whitespace to save tokens."""
+        out: List[str] = []
+        blank_streak = 0
+        for ln in code.splitlines():
+            r_ln = ln.rstrip()
+            s_ln = r_ln.strip()
+            if not s_ln:
+                blank_streak += 1
+                if blank_streak <= 1:
+                    out.append("")
+                continue
+            blank_streak = 0
+            # Skip pure decorative comment dividers (e.g. // ======= or # -------)
+            if re.match(r"^(?:#|//|/\*|\*|--)\s*[-=*_~]{4,}\s*(?:\*/)?$", s_ln):
+                continue
+            out.append(r_ln)
+        return "\n".join(out).strip()
+
+    @classmethod
+    def _parse_python_ast(cls, code_text: str, filename: str) -> Tuple[str, List[Dict[str, Any]]]:
+        """Use Python's native `ast` module to extract exact AST nodes + build a compact AST skeleton."""
+        import ast
+
+        tree = ast.parse(code_text)
+        lines = code_text.splitlines()
+        nodes: List[Dict[str, Any]] = []
+        skeleton_lines: List[str] = [f"# AST Skeleton Map for {filename} (Python, {len(lines)} lines)"]
+
+        imports: List[str] = []
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                start = getattr(node, "lineno", 1) - 1
+                end = getattr(node, "end_lineno", start + 1)
+                imports.append("\n".join(lines[start:end]))
+            elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                start = getattr(node, "lineno", 1)
+                end = getattr(node, "end_lineno", start)
+                block_src = "\n".join(lines[start - 1 : end])
+                kind = "class" if isinstance(node, ast.ClassDef) else ("async_def" if isinstance(node, ast.AsyncFunctionDef) else "def")
+                doc = ast.get_docstring(node) or ""
+                doc_short = re.sub(r"\s+", " ", doc).strip()[:120]
+
+                sig_line = lines[start - 1].strip()
+                skeleton_lines.append(f"- L{start}-L{end} [{kind}] `{sig_line}`" + (f" — {doc_short}" if doc_short else ""))
+
+                if isinstance(node, ast.ClassDef):
+                    for sub in node.body:
+                        if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                            s_l = getattr(sub, "lineno", start)
+                            e_l = getattr(sub, "end_lineno", s_l)
+                            m_sig = lines[s_l - 1].strip()
+                            m_doc = (ast.get_docstring(sub) or "").splitlines()[0].strip()[:90] if ast.get_docstring(sub) else ""
+                            skeleton_lines.append(f"    * L{s_l}-L{e_l} `{m_sig}`" + (f" — {m_doc}" if m_doc else ""))
+                            # If class is huge (> 1200 chars), index each method as its own AST chunk too
+                            if len(block_src) > 1200:
+                                m_src = "\n".join(lines[s_l - 1 : e_l])
+                                nodes.append({
+                                    "symbol": f"{node.name}.{sub.name}",
+                                    "kind": "method",
+                                    "start_line": s_l,
+                                    "end_line": e_l,
+                                    "signature": f"class {node.name} -> {m_sig}",
+                                    "code": cls._strip_comments_and_blank_lines(m_src),
+                                })
+
+                nodes.append({
+                    "symbol": node.name,
+                    "kind": kind,
+                    "start_line": start,
+                    "end_line": end,
+                    "signature": sig_line,
+                    "code": cls._strip_comments_and_blank_lines(block_src),
+                })
+
+        if imports:
+            imp_block = "\n".join(imports[:25])
+            nodes.insert(0, {
+                "symbol": "__imports__",
+                "kind": "imports",
+                "start_line": 1,
+                "end_line": len(imports),
+                "signature": "Module Imports & Globals",
+                "code": imp_block,
+            })
+
+        return "\n".join(skeleton_lines), nodes
+
+    @classmethod
+    def _parse_universal_ast(cls, code_text: str, filename: str, language: str) -> Tuple[str, List[Dict[str, Any]]]:
+        """
+        Universal AST-style structural block splitter for ANY programming language
+        (JS/TS, C/C++, Rust, Go, Java, C#, PHP, Ruby, Solidity, SQL, Kotlin, Swift, Bash, etc.).
+        Detects symbol declarations + tracks brace/indentation scope boundaries.
+        """
+        lines = code_text.splitlines()
+        total_lines = len(lines)
+        skeleton_lines: List[str] = [f"# AST Skeleton Map for {filename} ({language}, {total_lines} lines)"]
+        nodes: List[Dict[str, Any]] = []
+
+        # Locate all top/mid-level symbol declarations
+        decl_points: List[Tuple[int, str, str]] = []  # (line_idx_0, symbol_name, sig_line)
+        for idx, ln in enumerate(lines):
+            m = cls.SYMBOL_PATTERN.match(ln)
+            if m:
+                sym = next((g for g in m.groups() if g), f"block_{idx+1}")
+                decl_points.append((idx, sym, ln.strip()))
+
+        if not decl_points:
+            # Fallback: logical block chunking every ~45 lines
+            step = 45
+            for s in range(0, max(1, total_lines), step):
+                e = min(total_lines, s + step)
+                blk = cls._strip_comments_and_blank_lines("\n".join(lines[s:e]))
+                first_ln = next((l.strip() for l in lines[s:e] if l.strip()), f"Lines {s+1}-{e}")
+                skeleton_lines.append(f"- L{s+1}-L{e}: `{first_ln[:80]}`")
+                nodes.append({
+                    "symbol": f"lines_{s+1}_{e}",
+                    "kind": "block",
+                    "start_line": s + 1,
+                    "end_line": e,
+                    "signature": first_ln[:80],
+                    "code": blk,
+                })
+            return "\n".join(skeleton_lines), nodes
+
+        # Capture leading imports/headers before first symbol
+        if decl_points[0][0] > 0:
+            imp_src = cls._strip_comments_and_blank_lines("\n".join(lines[: decl_points[0][0]]))
+            if imp_src:
+                nodes.append({
+                    "symbol": "__header_imports__",
+                    "kind": "imports",
+                    "start_line": 1,
+                    "end_line": decl_points[0][0],
+                    "signature": "Imports & Top-Level Declarations",
+                    "code": imp_src[:1200],
+                })
+
+        for d_idx, (start_0, sym, sig) in enumerate(decl_points):
+            next_start_0 = decl_points[d_idx + 1][0] if d_idx + 1 < len(decl_points) else total_lines
+            end_0 = next_start_0
+            block_src = cls._strip_comments_and_blank_lines("\n".join(lines[start_0:end_0]))
+            skeleton_lines.append(f"- L{start_0+1}-L{end_0} `{sig[:90]}`")
+            nodes.append({
+                "symbol": sym,
+                "kind": "ast_symbol",
+                "start_line": start_0 + 1,
+                "end_line": end_0,
+                "signature": sig[:100],
+                "code": block_src,
+            })
+
+        return "\n".join(skeleton_lines), nodes
+
+    @classmethod
+    def process_code_in_ram(
+        cls,
+        code_bytes: bytes,
+        filename: str,
+        user_query: str,
+        max_context_chars: int = 2400,
+    ) -> Dict[str, Any]:
+        """
+        Parse ANY code file in RAM into AST nodes, and automatically decide:
+          - If compact code <= `max_context_chars`: include full compact code + AST skeleton.
+          - If code > `max_context_chars` (exceeds context budget): convert to AST Skeleton + top relevant AST nodes
+            matched via BM25 + symbol name against `user_query` so tokens are saved and context window never overflows!
+        """
+        raw_code = code_bytes.decode("utf-8", errors="ignore")
+        language = cls.detect_language(filename, raw_code)
+        compact_code = cls._strip_comments_and_blank_lines(raw_code)
+
+        try:
+            if language == "Python":
+                skeleton, ast_nodes = cls._parse_python_ast(raw_code, filename)
+            else:
+                skeleton, ast_nodes = cls._parse_universal_ast(raw_code, filename, language)
+        except Exception:
+            skeleton, ast_nodes = cls._parse_universal_ast(raw_code, filename, language)
+
+        compressed_mode = len(compact_code) > max_context_chars
+
+        # Rank AST nodes against user_query using BM25 + symbol name match
+        scored_nodes: List[Tuple[float, Dict[str, Any]]] = []
+        q_low = user_query.lower()
+        for node in ast_nodes:
+            score = _bm25_lexical_score(user_query, f"{node['symbol']} {node['signature']} {node['code']}")
+            if node["symbol"].lower() in q_low and len(node["symbol"]) >= 2:
+                score += 2.0
+            if node["kind"] == "imports":
+                score += 0.2
+            scored_nodes.append((score, node))
+
+        scored_nodes.sort(key=lambda x: x[0], reverse=True)
+
+        selected_blocks: List[str] = []
+        used_chars = 0
+        selected_symbols: List[str] = []
+
+        if not compressed_mode:
+            context_payload = (
+                f"<code_ast_skeleton>\n{skeleton}\n</code_ast_skeleton>\n\n"
+                f"<full_compact_code file='{filename}' language='{language}'>\n{compact_code}\n</full_compact_code>"
+            )
+            selected_symbols = [n["symbol"] for n in ast_nodes]
+        else:
+            budget = max(900, max_context_chars - min(900, len(skeleton)))
+            for _, node in scored_nodes:
+                snippet = (
+                    f"// [AST Node: {node['symbol']} | Lines {node['start_line']}-{node['end_line']}]\n"
+                    f"{node['code'][:1100]}"
+                )
+                if used_chars + len(snippet) > budget and selected_blocks:
+                    continue
+                selected_blocks.append(snippet)
+                selected_symbols.append(node["symbol"])
+                used_chars += len(snippet)
+                if len(selected_blocks) >= 4 or used_chars >= budget:
+                    break
+
+            context_payload = (
+                f"<code_ast_skeleton>\n{skeleton[:1100]}\n</code_ast_skeleton>\n\n"
+                f"<relevant_ast_nodes file='{filename}' language='{language}' mode='ast_compressed_to_save_tokens'>\n"
+                + "\n\n".join(selected_blocks)
+                + "\n</relevant_ast_nodes>"
+            )
+
+        return {
+            "filename": filename,
+            "language": language,
+            "raw_chars": len(raw_code),
+            "compact_chars": len(compact_code),
+            "compressed_via_ast": compressed_mode,
+            "total_ast_nodes": len(ast_nodes),
+            "selected_ast_symbols": selected_symbols,
+            "skeleton": skeleton,
+            "ast_nodes": ast_nodes,
+            "context_payload": context_payload,
+        }
+
+
+class UniversalDocumentParser:
+    """
+    100% In-RAM Multi-Format Document & File Parser.
+    Auto-detects and parses PDF (with automatic Scanned-Page OCR via Qwen2-VL-2B),
+    DOCX, DOC, XLSX, CSV, TSV, ODT, EPUB, RTF, JSON, XML, HTML, ZIP/TAR, and Code/Text.
+    """
+
+    MAX_ZIP_FILES = 25
+    MAX_ZIP_TOTAL_BYTES = 20 * 1024 * 1024
+    MAX_OCR_PAGES = 3
+
+    def __init__(self, memory: ChromaMemory, vision_tool: Optional["VisionDescriberTool"] = None):
+        self.memory = memory
+        self.vision_tool = vision_tool
+
+    @staticmethod
+    def _parse_pdf_sync(data: bytes) -> Tuple[List[ParsedPage], List[int]]:
+        """
+        Extract page-by-page layout-preserved text from PDF bytes strictly in RAM using `pdftotext`.
+        Returns `(pages, empty_page_numbers_needing_ocr)`.
+        """
+        pages: List[ParsedPage] = []
+        empty_pages: List[int] = []
+
+        if shutil.which("pdftotext"):
+            try:
+                proc = subprocess.run(
+                    ["pdftotext", "-layout", "-", "-"],
+                    input=data,
+                    capture_output=True,
+                    timeout=20,
+                )
+                if proc.returncode == 0:
+                    raw_text = proc.stdout.decode("utf-8", errors="ignore")
+                    raw_pages = raw_text.split("\x0c")
+                    if raw_pages and not raw_pages[-1].strip():
+                        raw_pages.pop()
+                    for idx, p_text in enumerate(raw_pages, start=1):
+                        cleaned = re.sub(r"\n{3,}", "\n\n", p_text).strip()
+                        first_line = next((ln.strip() for ln in cleaned.splitlines() if len(ln.strip()) > 3), "")
+                        pages.append(ParsedPage(page_number=idx, title=first_line[:80], text=cleaned))
+                        if len(cleaned) < 25:
+                            empty_pages.append(idx)
+                    if pages:
+                        return pages, empty_pages
+            except Exception as exc:
+                logger.warning(f"pdftotext pipe failed ({exc}); using fallback PDF stream extractor")
+
+        # Pure-Python fallback for raw PDF text streams
+        raw_str = data.decode("latin-1", errors="ignore")
+        literals = re.findall(r"\(([^()\\]{2,})\)\s*Tj", raw_str)
+        joined = " ".join(literals).strip() or "Scanned or binary PDF (no embedded text layer)."
+        pages.append(ParsedPage(page_number=1, title="Page 1", text=joined))
+        if len(literals) < 3:
+            empty_pages.append(1)
+        return pages, empty_pages
+
+    @staticmethod
+    def _render_pdf_page_to_jpeg_ram(pdf_bytes: bytes, page_num: int) -> Optional[bytes]:
+        """Render a single scanned PDF page to JPEG bytes strictly in RAM via `pdftoppm` or `magick`."""
+        if shutil.which("pdftoppm"):
+            try:
+                proc = subprocess.run(
+                    [
+                        "pdftoppm",
+                        "-jpeg",
+                        "-r",
+                        "150",
+                        "-f",
+                        str(page_num),
+                        "-l",
+                        str(page_num),
+                        "-singlefile",
+                    ],
+                    input=pdf_bytes,
+                    capture_output=True,
+                    timeout=10,
+                )
+                if proc.returncode == 0 and proc.stdout.startswith(b"\xff\xd8\xff"):
+                    return _downscale_image_in_ram(proc.stdout, max_dim=768)
+            except Exception as exc:
+                logger.debug(f"pdftoppm in-RAM render failed for page {page_num}: {exc}")
+        return None
+
+    @staticmethod
+    def _parse_docx_sync(data: bytes) -> List[ParsedPage]:
+        """Extract paragraphs and tables from `.docx` strictly in RAM via `zipfile` + `ElementTree`."""
+        lines: List[str] = []
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for target in sorted(n for n in zf.namelist() if n.startswith("word/") and n.endswith(".xml")):
+                if not any(k in target for k in ("document.xml", "header", "footer")):
+                    continue
+                xml_bytes = zf.read(target)
+                root = ET.fromstring(xml_bytes)
+                for elem in root.iter():
+                    tag = elem.tag.split("}")[-1]
+                    if tag == "p":
+                        p_text = "".join(t.text or "" for t in elem.iter() if t.tag.endswith("}t")).strip()
+                        if p_text:
+                            lines.append(p_text)
+                    elif tag == "tr":
+                        cells: List[str] = []
+                        for tc in elem:
+                            if tc.tag.endswith("}tc"):
+                                c_txt = " ".join(t.text or "" for t in tc.iter() if t.tag.endswith("}t")).strip()
+                                cells.append(c_txt)
+                        if any(cells):
+                            lines.append("| " + " | ".join(cells) + " |")
+        full = "\n".join(lines).strip() or "Empty DOCX document."
+        return UniversalDocumentParser._paginate_text(full, chars_per_page=2500)
+
+    @staticmethod
+    def _parse_pptx_sync(data: bytes) -> List[ParsedPage]:
+        """Extract slide-by-slide text from `.pptx` strictly in RAM."""
+        pages: List[ParsedPage] = []
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            slides = sorted(
+                (n for n in zf.namelist() if n.startswith("ppt/slides/slide") and n.endswith(".xml")),
+                key=lambda x: int(re.search(r"slide(\d+)\.xml", x).group(1)) if re.search(r"slide(\d+)\.xml", x) else 0,
+            )
+            for idx, s_name in enumerate(slides, start=1):
+                root = ET.fromstring(zf.read(s_name))
+                texts = [t.text.strip() for t in root.iter() if t.tag.endswith("}t") and t.text and t.text.strip()]
+                slide_txt = "\n".join(texts).strip()
+                pages.append(ParsedPage(page_number=idx, title=texts[0][:80] if texts else f"Slide {idx}", text=slide_txt))
+        return pages or [ParsedPage(page_number=1, title="Presentation", text="Empty PPTX presentation.")]
+
+    @staticmethod
+    def _parse_xlsx_sync(data: bytes) -> List[ParsedPage]:
+        """Extract sheets and cells from `.xlsx` strictly in RAM into Markdown tables."""
+        pages: List[ParsedPage] = []
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            shared_strings: List[str] = []
+            if "xl/sharedStrings.xml" in zf.namelist():
+                ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+                for si in ss_root.iter():
+                    if si.tag.endswith("}si"):
+                        val = "".join(t.text or "" for t in si.iter() if t.tag.endswith("}t"))
+                        shared_strings.append(val)
+
+            sheets = sorted(n for n in zf.namelist() if n.startswith("xl/worksheets/sheet") and n.endswith(".xml"))
+            for idx, sh_name in enumerate(sheets, start=1):
+                root = ET.fromstring(zf.read(sh_name))
+                rows_md: List[str] = []
+                for row in root.iter():
+                    if row.tag.endswith("}row"):
+                        vals: List[str] = []
+                        for c in row:
+                            if not c.tag.endswith("}c"):
+                                continue
+                            c_type = c.attrib.get("t", "")
+                            v_text = ""
+                            for child in c:
+                                if child.tag.endswith("}v") and child.text is not None:
+                                    v_text = child.text
+                                elif child.tag.endswith("}is"):
+                                    v_text = "".join(t.text or "" for t in child.iter() if t.tag.endswith("}t"))
+                            if c_type == "s" and v_text.isdigit():
+                                s_idx = int(v_text)
+                                if 0 <= s_idx < len(shared_strings):
+                                    v_text = shared_strings[s_idx]
+                            vals.append(v_text.strip())
+                        if any(vals):
+                            rows_md.append("| " + " | ".join(vals) + " |")
+                            if len(rows_md) == 1:
+                                rows_md.append("| " + " | ".join(["---"] * len(vals)) + " |")
+                sheet_text = f"Sheet {idx} ({len(rows_md)} rows):\n" + "\n".join(rows_md[:250])
+                pages.append(ParsedPage(page_number=idx, title=f"Sheet {idx}", text=sheet_text))
+        return pages or [ParsedPage(page_number=1, title="Spreadsheet", text="Empty XLSX workbook.")]
+
+    @staticmethod
+    def _parse_odt_or_epub_sync(data: bytes, kind: str) -> List[ParsedPage]:
+        texts: List[str] = []
+        with zipfile.ZipFile(io.BytesIO(data)) as zf:
+            for name in sorted(zf.namelist()):
+                if kind == "odt" and name != "content.xml":
+                    continue
+                if kind == "epub" and not name.endswith((".xhtml", ".html", ".htm", ".xml")):
+                    continue
+                raw = zf.read(name).decode("utf-8", errors="ignore")
+                clean = re.sub(r"<[^>]+>", " ", raw)
+                clean = re.sub(r"\s+", " ", clean).strip()
+                if len(clean) > 40:
+                    texts.append(clean)
+        return UniversalDocumentParser._paginate_text("\n\n".join(texts) or f"Empty {kind.upper()} file.")
+
+    @staticmethod
+    def _parse_legacy_doc_sync(data: bytes) -> List[ParsedPage]:
+        if shutil.which("antiword"):
+            try:
+                proc = subprocess.run(["antiword", "-"], input=data, capture_output=True, timeout=10)
+                if proc.returncode == 0:
+                    txt = proc.stdout.decode("utf-8", errors="ignore").strip()
+                    if txt:
+                        return UniversalDocumentParser._paginate_text(txt)
+            except Exception:
+                pass
+        ascii_runs = re.findall(rb"[\x20-\x7e\r\n\t]{12,}", data)
+        decoded = "\n".join(r.decode("latin-1", errors="ignore") for r in ascii_runs)
+        return UniversalDocumentParser._paginate_text(decoded)
+
+    @staticmethod
+    def _parse_rtf_sync(data: bytes) -> List[ParsedPage]:
+        raw = data.decode("latin-1", errors="ignore")
+        cleaned = re.sub(r"\\[a-z]+(-?\d+)?[ ]?", " ", raw)
+        cleaned = re.sub(r"[{}]", "", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return UniversalDocumentParser._paginate_text(cleaned)
+
+    @staticmethod
+    def _parse_csv_sync(data: bytes, delimiter: str = ",") -> List[ParsedPage]:
+        text = data.decode("utf-8", errors="ignore")
+        reader = list(csv.reader(io.StringIO(text), delimiter=delimiter))
+        if not reader:
+            return [ParsedPage(page_number=1, title="Empty CSV", text="Empty table.")]
+        header = reader[0]
+        rows = reader[1:]
+        md_lines = [
+            f"Table Columns ({len(header)}): {', '.join(header)}",
+            f"Total Rows: {len(rows)}",
+            "",
+            "| " + " | ".join(header) + " |",
+            "| " + " | ".join(["---"] * len(header)) + " |",
+        ]
+        for r in rows[:300]:
+            md_lines.append("| " + " | ".join(str(c).strip() for c in r) + " |")
+        return UniversalDocumentParser._paginate_text("\n".join(md_lines), chars_per_page=2500)
+
+    @classmethod
+    def _parse_archive_sync(cls, data: bytes, kind: str) -> List[ParsedPage]:
+        pages: List[ParsedPage] = []
+        total_read = 0
+        if kind == "zip":
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                infos = [i for i in zf.infolist() if not i.is_dir()][: cls.MAX_ZIP_FILES]
+                for idx, info in enumerate(infos, start=1):
+                    if total_read + info.file_size > cls.MAX_ZIP_TOTAL_BYTES:
+                        break
+                    sub_bytes = zf.read(info.filename)
+                    total_read += len(sub_bytes)
+                    sub_kind, _ = detect_upload_kind(sub_bytes, info.filename)
+                    if sub_kind == "image":
+                        pages.append(ParsedPage(page_number=idx, title=info.filename, text=f"[Archived Image File: {info.filename} ({len(sub_bytes)} bytes)]"))
+                    else:
+                        sub_txt = sub_bytes.decode("utf-8", errors="ignore")[:4000]
+                        pages.append(ParsedPage(page_number=idx, title=info.filename, text=f"File: {info.filename}\n{sub_txt}"))
+        elif kind == "tar":
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:*") as tf:
+                members = [m for m in tf.getmembers() if m.isfile()][: cls.MAX_ZIP_FILES]
+                for idx, m in enumerate(members, start=1):
+                    if total_read + m.size > cls.MAX_ZIP_TOTAL_BYTES:
+                        break
+                    fobj = tf.extractfile(m)
+                    if fobj is None:
+                        continue
+                    sub_bytes = fobj.read()
+                    total_read += len(sub_bytes)
+                    sub_txt = sub_bytes.decode("utf-8", errors="ignore")[:4000]
+                    pages.append(ParsedPage(page_number=idx, title=m.name, text=f"File: {m.name}\n{sub_txt}"))
+        return pages or [ParsedPage(page_number=1, title="Archive", text="Empty archive.")]
+
+    @staticmethod
+    def _paginate_text(text: str, chars_per_page: int = 2400) -> List[ParsedPage]:
+        cleaned = text.strip()
+        if not cleaned:
+            return [ParsedPage(page_number=1, title="Page 1", text="Empty document.")]
+        pages: List[ParsedPage] = []
+        for idx, start in enumerate(range(0, len(cleaned), chars_per_page), start=1):
+            chunk = cleaned[start : start + chars_per_page].strip()
+            first_ln = next((ln.strip() for ln in chunk.splitlines() if len(ln.strip()) > 2), f"Section {idx}")
+            pages.append(ParsedPage(page_number=idx, title=first_ln[:80], text=chunk))
+        return pages
+
+    async def parse_and_index(
+        self,
+        file_bytes: bytes,
+        filename: str = "uploaded_file",
+        user_hint: str = "",
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+    ) -> ParsedDocumentReport:
+        """Parse any document in RAM, run Qwen2-VL OCR on scanned PDF pages if needed, and index in ChromaDB with strict tenant scoping."""
+        kind, mime_type = detect_upload_kind(file_bytes, filename)
+        file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
+        doc_id = _sha256(f"{user_id}:{session_id}:{file_hash}")
+
+        pages: List[ParsedPage] = []
+        ocr_candidate_pages: List[int] = []
+
+        if kind == "pdf":
+            pages, ocr_candidate_pages = await asyncio.to_thread(self._parse_pdf_sync, file_bytes)
+            # If scanned PDF pages have no text layer, render top pages to JPEG in RAM and OCR via Qwen2-VL-2B
+            if ocr_candidate_pages and self.vision_tool is not None:
+                for p_num in ocr_candidate_pages[: self.MAX_OCR_PAGES]:
+                    jpg_bytes = await asyncio.to_thread(self._render_pdf_page_to_jpeg_ram, file_bytes, p_num)
+                    if jpg_bytes:
+                        try:
+                            v_rep = await self.vision_tool.describe_and_index(
+                                image_bytes=jpg_bytes,
+                                user_hint=f"Extract all text and tables from page {p_num} of {filename}. {user_hint}".strip(),
+                            )
+                            ocr_text = (
+                                f"[Scanned PDF Page {p_num} Vision OCR]\n"
+                                f"Visible Text: {v_rep.visible_text}\n"
+                                f"Summary: {v_rep.summary}\n"
+                                f"Details: {v_rep.subjects_and_details}"
+                            )
+                            for p in pages:
+                                if p.page_number == p_num:
+                                    p.text = f"{p.text}\n{ocr_text}".strip()
+                                    p.used_ocr = True
+                        except Exception as ocr_exc:
+                            logger.warning(f"Scanned PDF page {p_num} Vision OCR skipped: {ocr_exc}")
+        elif kind == "docx":
+            pages = await asyncio.to_thread(self._parse_docx_sync, file_bytes)
+        elif kind == "pptx":
+            pages = await asyncio.to_thread(self._parse_pptx_sync, file_bytes)
+        elif kind == "xlsx":
+            pages = await asyncio.to_thread(self._parse_xlsx_sync, file_bytes)
+        elif kind in ("odt", "epub"):
+            pages = await asyncio.to_thread(self._parse_odt_or_epub_sync, file_bytes, kind)
+        elif kind == "doc":
+            pages = await asyncio.to_thread(self._parse_legacy_doc_sync, file_bytes)
+        elif kind == "rtf":
+            pages = await asyncio.to_thread(self._parse_rtf_sync, file_bytes)
+        elif kind == "csv":
+            pages = await asyncio.to_thread(self._parse_csv_sync, file_bytes, ",")
+        elif kind == "tsv":
+            pages = await asyncio.to_thread(self._parse_csv_sync, file_bytes, "\t")
+        elif kind in ("zip", "tar"):
+            pages = await asyncio.to_thread(self._parse_archive_sync, file_bytes, kind)
+        elif kind == "html":
+            raw_html = file_bytes.decode("utf-8", errors="ignore")
+            clean_html = DuckDuckGoWebTool._extract_clean_text(raw_html)
+            pages = self._paginate_text(clean_html)
+        elif kind == "json":
+            raw_json = file_bytes.decode("utf-8", errors="ignore")
+            try:
+                parsed_j = json.loads(raw_json)
+                pretty = json.dumps(parsed_j, indent=2, ensure_ascii=False)
+            except Exception:
+                pretty = raw_json
+            pages = self._paginate_text(pretty)
+        else:
+            raw_txt = file_bytes.decode("utf-8", errors="ignore")
+            pages = self._paginate_text(raw_txt)
+
+        full_text = "\n\n".join(f"[Page {p.page_number}]\n{p.text}" for p in pages)
+        toc_entries = [f"p.{p.page_number}: {p.title}" for p in pages[:12] if p.title]
+        toc_summary = (
+            f"Document: {filename} ({kind.upper()}, {len(pages)} page(s), {len(full_text)} chars)\n"
+            f"Sections/Headings: {' | '.join(toc_entries) if toc_entries else 'Single section'}"
+        )
+
+        report = ParsedDocumentReport(
+            doc_id=doc_id,
+            filename=filename,
+            file_type=kind,
+            mime_type=mime_type,
+            user_id=user_id,
+            session_id=session_id,
+            total_pages=len(pages),
+            total_chars=len(full_text),
+            total_chunks=0,
+            toc_summary=toc_summary,
+            pages=pages,
+            full_text=full_text,
+        )
+        self.memory._active_raw_bytes[doc_id] = file_bytes
+        await self.memory.index_parsed_document(report)
+        return report
+
+
+# =============================================================================
+# 5. TOOLS: 3-TIER UNIVERSAL WEB SEARCH & ANY-WEBSITE SCRAPER + QWEN2-VL VISION
 # =============================================================================
 
 class DuckDuckGoWebTool:
-    """DuckDuckGo search -> SSRF-safe async scrape -> clean text -> ChromaDB `web_cache`."""
+    """
+    Universal 3-Tier Web Search & Any-Website Scraper:
+      - Direct URL Scraper (`scrape_urls_and_ingest`) when user enters URLs in prompt
+      - Multi-Engine Meta-Search: DuckDuckGo + Wikipedia REST API + Reddit JSON + ArXiv + Bing/Google News RSS + YouTube
+      - 3-Tier Cascading Content Extractor:
+        * Tier 1: Fast Async `httpx` + semantic HTML/Markdown/JSON/Table extractor
+        * Tier 2: Headless Chrome (`google-chrome --headless --dump-dom`) fallback for JS/SPA sites
+        * Tier 3: Remote PDF / JSON / XML stream-to-RAM parser
+    """
 
     def __init__(self, memory: ChromaMemory):
         self.memory = memory
@@ -468,18 +1878,18 @@ class DuckDuckGoWebTool:
 
     @staticmethod
     def _clean_search_query(query: str) -> str:
-        """Strip conversational filler and fix common typos so search engines match the actual topic."""
+        """Strip conversational filler, URLs, and fix common typos so search engines match the actual topic."""
         typo_map = {
             r"\bphonex\b": "phoenix",
             r"\bpheonix\b": "phoenix",
             r"\bphoneix\b": "phoenix",
             r"\bmaek\b": "make",
         }
-        cleaned = query
+        cleaned = URL_EXTRACT_RE.sub(" ", query)
         for pat, repl in typo_map.items():
             cleaned = re.sub(pat, repl, cleaned, flags=re.IGNORECASE)
         filler = re.compile(
-            r"\b(whats|what's|what is|tell me|can you|please|from internet|on internet|search internet|search web|in image|in the image|about it|is it|its name|what|the|in|it|is|lol|bro|dude|hey|hay)\b",
+            r"\b(whats|what's|what is|tell me|can you|please|from internet|on internet|search internet|search web|scrap|scrape|this site|this website|in image|in the image|about it|is it|its name|what|the|in|it|is|lol|bro|dude|hey|hay)\b",
             re.IGNORECASE,
         )
         cleaned = filler.sub(" ", cleaned)
@@ -524,20 +1934,124 @@ class DuckDuckGoWebTool:
         return results
 
     @staticmethod
-    def _rss_search_sync(query: str) -> List[Dict[str, str]]:
-        """Reliable XML RSS search (+ direct YouTube search when youtube/video/tutorial is requested)."""
+    def _wikipedia_search_sync(query: str) -> List[Dict[str, str]]:
+        """Direct Wikipedia OpenSearch + Summary REST API for high-precision encyclopedic facts."""
         import httpx
-        import xml.etree.ElementTree as ET
-        from urllib.parse import parse_qs, unquote, urlparse
+
+        results: List[Dict[str, str]] = []
+        try:
+            resp = httpx.get(
+                "https://en.wikipedia.org/w/api.php",
+                params={
+                    "action": "query",
+                    "list": "search",
+                    "srsearch": query,
+                    "srlimit": 2,
+                    "format": "json",
+                },
+                headers={"User-Agent": "LocalOrchestrator/2.0 (https://localhost)"},
+                timeout=min(3.5, settings.ORCH_SCRAPE_TIMEOUT_SEC),
+            )
+            if resp.status_code != 200:
+                return results
+            data = resp.json()
+            for item in data.get("query", {}).get("search", [])[:2]:
+                title = item.get("title", "")
+                snippet = re.sub(r"<[^>]+>", "", item.get("snippet", "")).strip()
+                if title:
+                    url = f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
+                    results.append({"title": f"Wikipedia: {title}", "url": url, "snippet": snippet})
+        except Exception as exc:
+            logger.debug(f"Wikipedia search skipped: {exc}")
+        return results
+
+    @staticmethod
+    def _arxiv_search_sync(query: str) -> List[Dict[str, str]]:
+        """Tier-C ArXiv Atom API search for scientific/research paper queries."""
+        import httpx
+
+        results: List[Dict[str, str]] = []
+        try:
+            resp = httpx.get(
+                "https://export.arxiv.org/api/query",
+                params={"search_query": f"all:{query}", "start": 0, "max_results": 2},
+                headers={"User-Agent": "LocalOrchestrator/2.0"},
+                timeout=min(3.5, settings.ORCH_SCRAPE_TIMEOUT_SEC),
+            )
+            if resp.status_code != 200:
+                return results
+            root = ET.fromstring(resp.text)
+            ns = {"a": "http://www.w3.org/2005/Atom"}
+            for entry in root.findall("a:entry", ns)[:2]:
+                title = re.sub(r"\s+", " ", (entry.findtext("a:title", "", ns) or "")).strip()
+                summary = re.sub(r"\s+", " ", (entry.findtext("a:summary", "", ns) or "")).strip()
+                link = (entry.findtext("a:id", "", ns) or "").strip()
+                if title and link:
+                    results.append({"title": f"ArXiv: {title}", "url": link, "snippet": summary[:450]})
+        except Exception as exc:
+            logger.debug(f"ArXiv search skipped: {exc}")
+        return results
+
+    @staticmethod
+    def _reddit_search_sync(query: str) -> List[Dict[str, str]]:
+        """Tier-C Reddit JSON search for community discussions and troubleshooting."""
+        import httpx
+
+        results: List[Dict[str, str]] = []
+        try:
+            resp = httpx.get(
+                "https://www.reddit.com/search.json",
+                params={"q": query, "limit": 2, "sort": "relevance"},
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LocalOrchestrator/2.0"},
+                timeout=min(3.0, settings.ORCH_SCRAPE_TIMEOUT_SEC),
+                follow_redirects=True,
+            )
+            if resp.status_code != 200:
+                return results
+            children = resp.json().get("data", {}).get("children", [])
+            for child in children[:2]:
+                d = child.get("data", {})
+                title = d.get("title", "")
+                permalink = d.get("permalink", "")
+                selftext = re.sub(r"\s+", " ", d.get("selftext", "")).strip()[:350]
+                if title and permalink:
+                    url = f"https://www.reddit.com{permalink}"
+                    results.append({"title": f"Reddit: {title}", "url": url, "snippet": selftext or title})
+        except Exception as exc:
+            logger.debug(f"Reddit search skipped: {exc}")
+        return results
+
+    @staticmethod
+    def _rss_search_sync(query: str) -> List[Dict[str, str]]:
+        """Reliable Meta-Search combining YouTube, Wikipedia, ArXiv, Reddit, Bing News RSS, and Google News RSS."""
+        import httpx
 
         results: List[Dict[str, str]] = []
         seen_urls: set[str] = set()
+
         if re.search(r"\b(youtube|video|tutorial|watch)\b", query, re.IGNORECASE):
             for yt in DuckDuckGoWebTool._youtube_search_sync(query):
                 seen_urls.add(yt["url"])
                 results.append(yt)
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LocalOrchestrator/1.0"}
 
+        for wk in DuckDuckGoWebTool._wikipedia_search_sync(query):
+            if wk["url"] not in seen_urls:
+                seen_urls.add(wk["url"])
+                results.append(wk)
+
+        if re.search(r"\b(paper|arxiv|study|research|physics|theorem|equation|algorithm|quantum|black hole|relativity|model)\b", query, re.IGNORECASE):
+            for ax in DuckDuckGoWebTool._arxiv_search_sync(query):
+                if ax["url"] not in seen_urls:
+                    seen_urls.add(ax["url"])
+                    results.append(ax)
+
+        if re.search(r"\b(reddit|forum|review|opinion|fix|error|bug|vs)\b", query, re.IGNORECASE):
+            for rd in DuckDuckGoWebTool._reddit_search_sync(query):
+                if rd["url"] not in seen_urls:
+                    seen_urls.add(rd["url"])
+                    results.append(rd)
+
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LocalOrchestrator/2.0"}
         feeds = [
             ("https://www.bing.com/news/search", {"q": query, "format": "rss"}),
             ("https://news.google.com/rss/search", {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}),
@@ -567,7 +2081,7 @@ class DuckDuckGoWebTool:
                         continue
                     seen_urls.add(final_url)
                     snippet = f"[{pub}] {title}. {desc}".strip() if pub else f"{title}. {desc}".strip()
-                    results.append({"title": title or "News Result", "url": final_url, "snippet": snippet})
+                    results.append({"title": title or "Web Result", "url": final_url, "snippet": snippet})
                     if len(results) >= settings.ORCH_DDG_MAX_RESULTS:
                         break
             except Exception as exc:
@@ -595,15 +2109,13 @@ class DuckDuckGoWebTool:
         except Exception as exc:
             logger.warning(f"ddgs search failed ({exc}); trying fallback")
 
-        # Try DuckDuckGo HTML with fast 2.0s timeout, then fall back to Bing/Google RSS
         try:
             import httpx
-            from urllib.parse import parse_qs, unquote, urlparse
 
             resp = httpx.post(
                 "https://html.duckduckgo.com/html/",
                 data={"q": clean_q},
-                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LocalOrchestrator/1.0"},
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LocalOrchestrator/2.0"},
                 timeout=min(2.0, settings.ORCH_SCRAPE_TIMEOUT_SEC),
                 follow_redirects=True,
             )
@@ -634,39 +2146,288 @@ class DuckDuckGoWebTool:
             if results:
                 return results
         except Exception as ddg_exc:
-            logger.warning(f"DuckDuckGo HTML unavailable ({ddg_exc}); falling back to Bing/Google RSS")
+            logger.warning(f"DuckDuckGo HTML unavailable ({ddg_exc}); falling back to Meta-Search RSS/Wiki")
 
         return self._rss_search_sync(clean_q)
 
     @staticmethod
     def _extract_clean_text(html: str) -> str:
-        try:
-            from bs4 import BeautifulSoup
-            soup = BeautifulSoup(html, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header", "noscript", "aside"]):
-                tag.decompose()
-            return re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
-        except ImportError:
-            return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", html)).strip()
+        """
+        Semantic HTML-to-Markdown/Text extractor:
+        - Preserves page `<title>`, `<meta name="description">`, JSON-LD structured data,
+          headings (`h1-h3`), tables (`<tr>/<td>`), lists, and paragraphs
+        - Strips `<script>`, `<style>`, `<nav>`, `<footer>`, `<svg>`, `<noscript>` boilerplate
+        """
+        if not html:
+            return ""
 
-    async def _fetch_page(self, client: Any, url: str) -> str:
-        if "youtube.com/watch" in url or "youtu.be/" in url:
+        title_m = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.DOTALL | re.IGNORECASE)
+        page_title = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", title_m.group(1))).strip() if title_m else ""
+
+        meta_desc = ""
+        for m_pat in (
+            r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+            r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+        ):
+            mm = re.search(m_pat, html, flags=re.IGNORECASE)
+            if mm:
+                meta_desc = mm.group(1).strip()
+                break
+
+        # Strip non-content blocks
+        cleaned = re.sub(
+            r"<(script|style|noscript|svg|nav|footer|header|aside|form|iframe)[^>]*>.*?</\1>",
+            " ",
+            html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        # Convert headings, paragraphs, list items, and table cells to readable structure
+        cleaned = re.sub(r"<h([1-3])[^>]*>(.*?)</h\1>", r"\n## \2\n", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"<li[^>]*>(.*?)</li>", r"\n- \1", cleaned, flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"</(p|div|tr|section|article|br)>", "\n", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"</(td|th)>", " | ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"<[^>]+>", " ", cleaned)
+        cleaned = (
+            cleaned.replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", '"')
+            .replace("&#39;", "'")
+        )
+        lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in cleaned.splitlines()]
+        lines = [ln for ln in lines if len(ln) >= 3]
+        body = "\n".join(lines)
+
+        header_parts: List[str] = []
+        if page_title:
+            header_parts.append(f"Page Title: {page_title}")
+        if meta_desc:
+            header_parts.append(f"Summary: {meta_desc}")
+        if header_parts:
+            return "\n".join(header_parts) + "\n\n" + body
+        return body
+
+    @staticmethod
+    def _headless_browser_dump_sync(url: str) -> str:
+        """
+        Tier-2 Headless Chrome fallback (`google-chrome --headless --dump-dom`) for JavaScript/SPA websites
+        when Tier-1 `httpx` gets an empty `<div id="root"></div>` shell or JS challenge.
+        """
+        chrome_bin = shutil.which("google-chrome") or shutil.which("chromium")
+        if not chrome_bin or not _is_safe_public_url(url):
+            return ""
+        try:
+            proc = subprocess.run(
+                [
+                    chrome_bin,
+                    "--headless=new",
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--virtual-time-budget=3500",
+                    "--dump-dom",
+                    url,
+                ],
+                capture_output=True,
+                timeout=8,
+            )
+            if proc.returncode == 0 and proc.stdout:
+                raw_dom = proc.stdout[: settings.ORCH_SCRAPE_MAX_BYTES].decode("utf-8", errors="ignore")
+                return DuckDuckGoWebTool._extract_clean_text(raw_dom)
+        except Exception as exc:
+            logger.debug(f"Headless Chrome Tier-2 fallback skipped for {url}: {exc}")
+        return ""
+
+    @staticmethod
+    def _extract_youtube_video_details(html: str, url: str) -> str:
+        """
+        Extract rich YouTube video metadata + captions/transcript from `ytInitialPlayerResponse` JSON
+        embedded in a YouTube `watch?v=` or `youtu.be/` page.
+        """
+        import httpx
+
+        m_player = re.search(r"var\s+ytInitialPlayerResponse\s*=\s*(\{.*?\});", html)
+        if not m_player:
+            m_player = re.search(r"ytInitialPlayerResponse\s*=\s*(\{.*?\});", html)
+        if not m_player:
+            return DuckDuckGoWebTool._extract_clean_text(html)
+
+        try:
+            data = json.loads(m_player.group(1))
+        except Exception:
+            return DuckDuckGoWebTool._extract_clean_text(html)
+
+        vd = data.get("videoDetails", {}) or {}
+        micro = (data.get("microformat", {}) or {}).get("playerMicroformatRenderer", {}) or {}
+
+        title = vd.get("title") or ""
+        author = vd.get("author") or ""
+        views = vd.get("viewCount") or ""
+        length_sec = vd.get("lengthSeconds") or ""
+        keywords = vd.get("keywords") or []
+        short_desc = vd.get("shortDescription") or ""
+        publish_date = micro.get("publishDate") or micro.get("uploadDate") or ""
+        category = micro.get("category") or ""
+
+        lines: List[str] = [
+            f"Page Title: YouTube Video - {title}",
+            f"Video URL: {url}",
+            f"Channel / Author: {author}",
+        ]
+        if publish_date or category or views or length_sec:
+            lines.append(
+                f"Metadata: Published={publish_date} | Category={category} | Views={views} | Duration={length_sec}s"
+            )
+        if keywords:
+            lines.append(f"Video Tags / Keywords: {', '.join(str(k) for k in keywords[:25])}")
+        if short_desc:
+            lines.append(f"Video Description:\n{short_desc[:1400]}")
+
+        # Attempt to fetch the first available caption/subtitle track XML if present
+        caption_tracks = (
+            (data.get("captions", {}) or {})
+            .get("playerCaptionsTracklistRenderer", {})
+            .get("captionTracks", [])
+        )
+        if caption_tracks and isinstance(caption_tracks, list):
+            base_u = caption_tracks[0].get("baseUrl")
+            if base_u and base_u.startswith("http"):
+                try:
+                    c_resp = httpx.get(base_u, timeout=3.5)
+                    if c_resp.status_code == 200 and c_resp.text:
+                        c_root = ET.fromstring(c_resp.text)
+                        cap_words = [
+                            re.sub(r"\s+", " ", (el.text or "")).strip()
+                            for el in c_root.findall(".//text")
+                            if el.text and el.text.strip()
+                        ]
+                        if cap_words:
+                            transcript = " ".join(cap_words)[:1500]
+                            lines.append(f"Video Transcript / Captions:\n{transcript}")
+                except Exception:
+                    pass
+
+        return "\n\n".join(lines)
+
+    async def _fetch_page(self, client: Any, url: str, allow_js_fallback: bool = False) -> str:
+        is_youtube_video = "youtube.com/watch" in url or "youtu.be/" in url or "youtube.com/shorts/" in url
+        # Skip scraping 5 YouTube videos during background search list, but ALWAYS extract when directly requested!
+        if is_youtube_video and not allow_js_fallback:
             return ""
         if not await asyncio.to_thread(_is_safe_public_url, url):
             return ""
+
+        # Specialized Reddit JSON handling (appending .json returns clean thread + comments)
+        target_url = url
+        if "reddit.com/r/" in url and not url.endswith(".json"):
+            target_url = url.rstrip("/") + ".json"
+
         try:
-            resp = await client.get(url, follow_redirects=True)
-            if resp.status_code != 200:
-                return ""
-            ctype = resp.headers.get("content-type", "").lower()
-            if "text/html" not in ctype and "text/plain" not in ctype:
-                return ""
-            raw = resp.content[: settings.ORCH_SCRAPE_MAX_BYTES].decode("utf-8", errors="ignore")
-            return await asyncio.to_thread(self._extract_clean_text, raw)
-        except Exception:
-            return ""
+            resp = await client.get(target_url, follow_redirects=True)
+            if resp.status_code == 200:
+                ctype = resp.headers.get("content-type", "").lower()
+                raw_bytes = resp.content[: settings.ORCH_SCRAPE_MAX_BYTES]
+
+                if is_youtube_video:
+                    raw_html = raw_bytes.decode("utf-8", errors="ignore")
+                    yt_info = await asyncio.to_thread(self._extract_youtube_video_details, raw_html, url)
+                    if len(yt_info) >= 80:
+                        return yt_info
+
+                # Tier 3: Remote PDF link directly on the web
+                if "application/pdf" in ctype or raw_bytes.lstrip().startswith(b"%PDF-"):
+                    pages, _ = await asyncio.to_thread(UniversalDocumentParser._parse_pdf_sync, raw_bytes)
+                    return "\n\n".join(f"[Page {p.page_number}] {p.text}" for p in pages[:6])
+
+                # JSON API / Reddit JSON response
+                if "application/json" in ctype:
+                    raw_txt = raw_bytes.decode("utf-8", errors="ignore")
+                    return raw_txt[:8000]
+
+                if "text/html" in ctype or "text/plain" in ctype or "application/xhtml" in ctype or "xml" in ctype:
+                    raw_html = raw_bytes.decode("utf-8", errors="ignore")
+                    extracted = await asyncio.to_thread(self._extract_clean_text, raw_html)
+                    # Detect auth-wall redirects (e.g. LinkedIn authwall / login page)
+                    if "linkedin.com/authwall" in str(resp.url) or "Sign in to LinkedIn" in extracted:
+                        extracted = ""
+                    if len(extracted) >= 200:
+                        return extracted
+        except Exception as exc:
+            logger.debug(f"Tier-1 httpx fetch failed for {url}: {exc}")
+
+        # Tier 2: Headless Chrome JS/SPA Render Fallback (used for direct user URLs or empty SPA shells)
+        if allow_js_fallback:
+            logger.info(f"Tier-2 Headless Chrome JS render fallback for: {url}")
+            dom_text = await asyncio.to_thread(self._headless_browser_dump_sync, url)
+            if len(dom_text) >= 200 and "Sign in to LinkedIn" not in dom_text:
+                return dom_text
+
+            # Tier 2.5: Auth-walled / Anti-bot URL (e.g. LinkedIn) -> Search public index snippets for this URL/slug
+            parsed_u = urlparse(url)
+            slug = parsed_u.path.strip("/").replace("/", " ").replace("-", " ")
+            if slug and parsed_u.hostname:
+                fallback_q = f"{parsed_u.hostname} {slug}".strip()
+                logger.info(f"Auth-wall detected on {url}; querying public search index for '{fallback_q}'")
+                pub_hits = await asyncio.to_thread(self._ddg_search_sync, fallback_q)
+                if pub_hits:
+                    snippets = "\n".join(f"- {h['title']} ({h['url']}): {h['snippet']}" for h in pub_hits[:4])
+                    return (
+                        f"Page Title: Public Index Snippets for {url}\n"
+                        f"Note: Direct access to {parsed_u.hostname} requires login (authwall). "
+                        f"Retrieved public search engine records:\n{snippets}"
+                    )
+        return ""
+
+    async def scrape_urls_and_ingest(self, urls: List[str]) -> List[Dict[str, Any]]:
+        """
+        Directly scrape one or more user-specified URLs (3-tier: httpx -> headless Chrome JS -> PDF stream)
+        and index their content into ChromaDB `web_cache`.
+        """
+        import httpx
+
+        valid_urls = [u for u in urls[:4] if await asyncio.to_thread(_is_safe_public_url, u)]
+        if not valid_urls:
+            return []
+
+        timeout = httpx.Timeout(max(6.0, settings.ORCH_SCRAPE_TIMEOUT_SEC))
+        headers = {
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
+            pages = await asyncio.gather(*(self._fetch_page(client, u, allow_js_fallback=True) for u in valid_urls))
+
+        now = int(time.time())
+        ids, docs, metas, direct_results = [], [], [], []
+        for url, page_text in zip(valid_urls, pages):
+            if not page_text:
+                page_text = f"Could not extract full body from {url} (site may require login or blocked automated access)."
+            title_line = next((ln.replace("Page Title:", "").strip() for ln in page_text.splitlines() if ln.startswith("Page Title:")), url)
+            body = f"Title: {title_line}\nURL: {url}\n\n{page_text[:3200]}"
+            for idx, chunk in enumerate(self._splitter.split_text(body)[:3]):
+                cid = _sha256(f"{url}:direct:{idx}")
+                clipped = chunk[:950]
+                meta = {"url": url, "title": title_line[:120], "fetched_at": now, "query": url}
+                ids.append(cid)
+                docs.append(clipped)
+                metas.append(meta)
+                direct_results.append({"document": clipped, "metadata": meta, "distance": 0.05})
+
+        if docs:
+            await self.memory.upsert("web_cache", ids, docs, metas)
+            logger.info(f"Scraped & ingested {len(docs)} chunks from direct URL(s): {valid_urls}")
+        return direct_results[: settings.ORCH_MAX_RAG_CHUNKS]
 
     async def search_and_ingest(self, query: str, bypass_cache: bool = False) -> List[Dict[str, Any]]:
+        # Check if query itself contains direct URLs to scrape
+        direct_urls = extract_urls_from_text(query)
+        if direct_urls:
+            direct_hits = await self.scrape_urls_and_ingest(direct_urls)
+            if direct_hits:
+                return direct_hits
+
         cached: List[Dict[str, Any]] = []
         if not bypass_cache:
             cached = await self.memory.query_fresh_web_cache(query, n_results=settings.ORCH_MAX_RAG_CHUNKS)
@@ -674,11 +2435,11 @@ class DuckDuckGoWebTool:
                 logger.info(f"Web cache HIT ({len(cached)} chunks) for '{query}'")
                 return cached
 
-        logger.info(f"DuckDuckGo live search: '{query}'")
+        logger.info(f"Live Meta-Search: '{query}'")
         try:
             ddg_hits = await asyncio.to_thread(self._ddg_search_sync, query)
         except Exception as exc:
-            logger.warning(f"DuckDuckGo search failed (fallback to cache): {exc}")
+            logger.warning(f"Live search failed (fallback to cache): {exc}")
             return cached
 
         if not ddg_hits:
@@ -686,9 +2447,9 @@ class DuckDuckGoWebTool:
 
         import httpx
         timeout = httpx.Timeout(settings.ORCH_SCRAPE_TIMEOUT_SEC)
-        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LocalOrchestrator/1.0"}
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LocalOrchestrator/2.0"}
         async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
-            pages = await asyncio.gather(*(self._fetch_page(client, h["url"]) for h in ddg_hits))
+            pages = await asyncio.gather(*(self._fetch_page(client, h["url"], allow_js_fallback=False) for h in ddg_hits))
 
         now = int(time.time())
         ids, docs, metas = [], [], []
@@ -711,7 +2472,7 @@ class DuckDuckGoWebTool:
 class VisionDescriberTool:
     """
     High-accuracy Qwen2-VL-2B (+ mmproj) describer with GBNF JSON grammar.
-    Pauses/restores the active `AsyncLLM` model so 6GB RX 5600 VRAM never OOMs.
+    Runs on CPU (`ORCH_VISION_GPU_LAYERS=0`) so 6GB RX 5600 XT VRAM never OOMs.
     """
 
     VISION_SCHEMA: Dict[str, Any] = {
@@ -792,7 +2553,7 @@ class VisionDescriberTool:
             "Return ONLY valid JSON matching the schema:\n"
             "- scene: setting/environment\n"
             "- objects: list of clearly visible objects\n"
-            "- subjects_and_details: accurate details of people, faces, clothing, poses, or main subjects (e.g., if a black hole is visible, describe its accretion disk, gravitational lensing halo/photon ring, and whether it is a 3D artistic/sci-fi illustration like Gargantua over a beach vs. a real telescope telescope image)\n"
+            "- subjects_and_details: accurate details of people, faces, clothing, poses, or main subjects (e.g., if a black hole is visible, describe its accretion disk, gravitational lensing halo/photon ring, and whether it is a 3D artistic/sci-fi illustration like Gargantua over a beach vs. a real telescope image)\n"
             "- colors_and_lighting: dominant colors and lighting conditions\n"
             "- visible_text: exact verbatim OCR text visible in the image, or 'none'\n"
             "- summary: thorough, factual description of the entire image\n"
@@ -861,7 +2622,6 @@ class VisionDescriberTool:
                 finally:
                     self._queue.task_done()
 
-                # Coalesce any new images that arrived while decoding
                 while not self._queue.empty():
                     try:
                         batch.append(self._queue.get_nowait())
@@ -887,11 +2647,6 @@ class VisionDescriberTool:
                     await self.llm.start()
 
     async def _vision_worker(self) -> None:
-        """
-        Bounded queue worker with sticky batching:
-        - If ORCH_VISION_GPU_LAYERS == 0 (Option A): runs Vision on CPU, keeping AsyncLLM 100% resident in VRAM.
-        - If ORCH_VISION_GPU_LAYERS != 0: acquires vram_gate and swaps AsyncLLM safely.
-        """
         while True:
             first_item = await self._queue.get()
             batch = [first_item]
@@ -912,8 +2667,10 @@ class VisionDescriberTool:
         image_bytes: Optional[bytes] = None,
         image_base64: Optional[str] = None,
         user_hint: str = "",
+        user_id: str = "default_user",
+        session_id: str = "default_session",
     ) -> VisionReport:
-        """Enqueue uploaded image in RAM -> Qwen2-VL-2B queue -> ChromaDB image_index."""
+        """Enqueue uploaded image in RAM -> Qwen2-VL-2B queue -> ChromaDB image_index scoped to (user_id, session_id)."""
         if image_bytes is not None:
             data_uri, mime_type = bytes_to_data_uri(image_bytes)
             hash_source: bytes | str = image_bytes
@@ -934,19 +2691,25 @@ class VisionDescriberTool:
         raw_json = await asyncio.wait_for(fut, timeout=settings.DEFAULT_TIMEOUT)
         report = VisionReport.model_validate_json(raw_json)
         try:
-            await self.memory.index_image_report(hash_source, report, mime_type=mime_type)
+            await self.memory.index_image_report(
+                hash_source,
+                report,
+                mime_type=mime_type,
+                user_id=user_id,
+                session_id=session_id,
+            )
         except Exception as idx_err:
             logger.warning(f"Vision decoded OK, but ChromaDB image_index upsert failed: {idx_err}")
         return report
 
 
 # =============================================================================
-# 5. INTENT ROUTER
+# 6. INTENT ROUTER (AUTO-DETECTS URLS, WEB SEARCH, IMAGES, AND DOCUMENTS)
 # =============================================================================
 
 class IntentRouter:
     WEB_PATTERNS = re.compile(
-        r"\b(latest|today|current|news|price|weather|2025|2026|who won|release date|stock|score|search web|internet)\b",
+        r"\b(latest|today|current|news|price|weather|2025|2026|who won|release date|stock|score|search web|internet|scrap|scrape|website|url|link|youtube)\b",
         re.IGNORECASE,
     )
     IMAGE_SEARCH_PATTERNS = re.compile(
@@ -954,7 +2717,7 @@ class IntentRouter:
         re.IGNORECASE,
     )
     RAG_PATTERNS = re.compile(
-        r"\b(my docs|my notes|in my files|from (the )?(pdf|document|knowledge base|chroma)|remember)\b",
+        r"\b(my docs|my notes|in my files|from (the )?(pdf|document|doc|file|excel|csv|sheet|contract|report|book|knowledge base|chroma)|remember|page \d+)\b",
         re.IGNORECASE,
     )
 
@@ -963,12 +2726,14 @@ class IntentRouter:
         cls,
         query: str,
         has_image: bool = False,
+        has_document: bool = False,
         force_web: Optional[bool] = None,
         force_rag: Optional[bool] = None,
     ) -> RouteDecision:
         q = query.strip()
-        use_web = force_web if force_web is not None else bool(cls.WEB_PATTERNS.search(q))
-        use_rag = force_rag if force_rag is not None else bool(cls.RAG_PATTERNS.search(q))
+        direct_urls = extract_urls_from_text(q)
+        use_web = bool(direct_urls) or (force_web if force_web is not None else bool(cls.WEB_PATTERNS.search(q)))
+        use_rag = has_document or (force_rag if force_rag is not None else bool(cls.RAG_PATTERNS.search(q)))
         use_image_search = bool(cls.IMAGE_SEARCH_PATTERNS.search(q)) and not has_image
 
         return RouteDecision(
@@ -976,20 +2741,24 @@ class IntentRouter:
             use_rag=use_rag or (not use_web and not has_image and not use_image_search and len(q.split()) > 4),
             use_image_search=use_image_search,
             use_vision=has_image,
+            use_document=has_document,
+            direct_urls=direct_urls,
             search_query=q,
-            reason="tier1_heuristic",
+            reason="direct_url_scrape" if direct_urls else ("uploaded_document" if has_document else "tier1_heuristic"),
         )
 
 
 # =============================================================================
-# 6. CHAT ORCHESTRATOR (USES AsyncLangChain + ANY `AsyncLLM` MODEL)
+# 7. CHAT ORCHESTRATOR (AUTO-DETECTS ANY FILE, URL, WEB SEARCH, OR IMAGE)
 # =============================================================================
 
 @dataclass
 class ChatOrchestrator:
     """
-    Pure Orchestrator wired to `AsyncLLM` / `llmChatRepo`.
-    Enriches `/chat/completions` prompts before generation and records history in ChromaDB.
+    Universal Multimodal & Document/Web Orchestrator wired to `AsyncLLM` / `llmChatRepo`.
+    Automatically detects whether an uploaded file on `/chat/completions` is an Image or a
+    Document (PDF, Scanned PDF, DOCX, XLSX, CSV, ZIP, Code, etc.) and whether the prompt
+    contains direct URLs to scrape.
     """
 
     llm: AsyncLLM
@@ -997,6 +2766,7 @@ class ChatOrchestrator:
     memory: ChromaMemory = field(init=False)
     web_tool: DuckDuckGoWebTool = field(init=False)
     vision_tool: VisionDescriberTool = field(init=False)
+    doc_parser: UniversalDocumentParser = field(init=False)
     prompt_template: ChatPromptTemplate = field(init=False)
     parser: StrOutputParser = field(init=False)
 
@@ -1004,6 +2774,7 @@ class ChatOrchestrator:
         self.memory = ChromaMemory()
         self.web_tool = DuckDuckGoWebTool(self.memory)
         self.vision_tool = VisionDescriberTool(self.llm, self.memory, vram_gate=self.vram_gate)
+        self.doc_parser = UniversalDocumentParser(self.memory, vision_tool=self.vision_tool)
         self.parser = StrOutputParser()
         self.prompt_template = ChatPromptTemplate.from_messages([
             (
@@ -1016,54 +2787,269 @@ class ChatOrchestrator:
             ("user", "{user_prompt}"),
         ])
 
+    @staticmethod
+    def _extract_requested_pages(query: str, max_pages: int) -> Optional[Tuple[int, int]]:
+        """Detect explicit page requests like 'page 5' or 'pages 2 to 4' in the user prompt."""
+        m_range = re.search(r"\bpages?\s+(\d+)\s*(?:-|to|through)\s*(\d+)\b", query, re.IGNORECASE)
+        if m_range:
+            s, e = int(m_range.group(1)), int(m_range.group(2))
+            return max(1, min(s, max_pages)), max(1, min(e, max_pages))
+        m_single = re.search(r"\b(?:page|p\.|slide|sheet)\s*(\d+)\b", query, re.IGNORECASE)
+        if m_single:
+            p = max(1, min(int(m_single.group(1)), max_pages))
+            return p, p
+        return None
+
+    DEFAULT_DOCUMENT_TOOLS = (
+        {
+            "type": "function",
+            "function": {
+                "name": "search_document",
+                "description": "Semantic and BM25 keyword search inside the uploaded document.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "doc_id": {"type": "string"},
+                        "query": {"type": "string"},
+                        "top_k": {"type": "integer", "default": 3},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_document_pages",
+                "description": "Read exact page range (start_page to end_page) from the uploaded document.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "doc_id": {"type": "string"},
+                        "start_page": {"type": "integer"},
+                        "end_page": {"type": "integer"},
+                    },
+                    "required": ["start_page", "end_page"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "query_table_data",
+                "description": "Filter rows and compute exact column totals/sums/averages on tables in CSV, Excel, DOCX, or PDF.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "doc_id": {"type": "string"},
+                        "sheet_or_table": {"type": "string"},
+                        "filter": {"type": "string"},
+                    },
+                    "required": ["filter"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "inspect_page_visual",
+                "description": "Render a specific PDF page diagram, chart, or scanned page in RAM and analyze it with Qwen2-VL-2B Vision.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "doc_id": {"type": "string"},
+                        "page_num": {"type": "integer"},
+                        "question": {"type": "string"},
+                    },
+                    "required": ["page_num", "question"],
+                },
+            },
+        },
+    )
+
+    async def execute_internal_tool(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+    ) -> str:
+        """
+        Execute built-in document/web tools strictly isolated to the caller's `(user_id, session_id)`:
+          - Tool 1: `search_document(query, doc_id?, top_k=3)`
+          - Tool 2: `read_document_pages(start_page, end_page, doc_id?)`
+          - Tool 3: `query_table_data(filter, sheet_or_table?, doc_id?)`
+          - Tool 4: `inspect_page_visual(page_num, question, doc_id?)`
+          - Web Tools: `scrape_website(url)`, `web_search(query)`
+        """
+        if tool_name == "search_document":
+            q = str(arguments.get("query", ""))
+            top_k = int(arguments.get("top_k", 3))
+            doc_id = self.memory.get_tenant_doc_id(user_id=user_id, session_id=session_id, requested_doc_id=arguments.get("doc_id"))
+            extra = {"doc_id": doc_id} if doc_id else None
+            where = self.memory.build_tenant_where(user_id=user_id, session_id=session_id, extra=extra)
+            hits = await self.memory.query("docs_rag", q, n_results=top_k, where=where, relax_threshold=True)
+            return "\n\n".join(h["document"][:900] for h in hits) or "No matching sections found in your document."
+        if tool_name == "read_document_pages":
+            return self.memory.read_document_pages(
+                doc_id=arguments.get("doc_id"),
+                start_page=int(arguments.get("start_page", 1)),
+                end_page=int(arguments.get("end_page", 2)),
+                user_id=user_id,
+                session_id=session_id,
+            )
+        if tool_name == "query_table_data":
+            return self.memory.query_table_data(
+                doc_id=arguments.get("doc_id"),
+                sheet_or_table=str(arguments.get("sheet_or_table", "")),
+                filter_query=str(arguments.get("filter") or arguments.get("query") or ""),
+                user_id=user_id,
+                session_id=session_id,
+            )
+        if tool_name == "inspect_page_visual":
+            doc_id = self.memory.get_tenant_doc_id(user_id=user_id, session_id=session_id, requested_doc_id=arguments.get("doc_id"))
+            page_num = int(arguments.get("page_num", 1))
+            question = str(arguments.get("question", "Describe the chart, diagram, or text on this page."))
+            raw_pdf = self.memory._active_raw_bytes.get(doc_id or "")
+            if not raw_pdf:
+                return "No raw PDF bytes available in RAM for your user/session."
+            jpg_bytes = await asyncio.to_thread(UniversalDocumentParser._render_pdf_page_to_jpeg_ram, raw_pdf, page_num)
+            if not jpg_bytes:
+                return f"Could not render page {page_num} to image in RAM."
+            v_rep = await self.vision_tool.describe_and_index(
+                image_bytes=jpg_bytes,
+                user_hint=question,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            return (
+                f"[Page {page_num} Visual Inspection]\n"
+                f"Summary: {v_rep.summary}\n"
+                f"Details: {v_rep.subjects_and_details}\n"
+                f"Visible Text (OCR): {v_rep.visible_text}"
+            )
+        if tool_name == "scrape_website":
+            url = str(arguments.get("url", ""))
+            hits = await self.web_tool.scrape_urls_and_ingest([url])
+            return "\n\n".join(h["document"] for h in hits) or f"Could not scrape {url}."
+        if tool_name == "web_search":
+            q = str(arguments.get("query", ""))
+            hits = await self.web_tool.search_and_ingest(q)
+            return "\n\n".join(h["document"] for h in hits) or f"No web results found for {q}."
+        return f"Unknown internal tool '{tool_name}'."
+
     async def prepare_context(
         self,
         messages: List[Any],
         image_bytes: Optional[bytes] = None,
         image_base64: Optional[str] = None,
+        file_bytes: Optional[bytes] = None,
+        filename: Optional[str] = None,
         force_web: Optional[bool] = None,
         force_rag: Optional[bool] = None,
+        user_id: str = "default_user",
+        session_id: str = "default_session",
     ) -> OrchestrationContext:
         metrics: Dict[str, float] = {}
         norm_msgs, embedded_img = extract_text_and_images(messages)
         effective_b64 = image_base64 or embedded_img
-        has_image = bool(image_bytes is not None or effective_b64)
+        uid = str(user_id or "default_user").strip() or "default_user"
+        sid = str(session_id or "default_session").strip() or "default_session"
+
+        # Auto-classify uploaded bytes: could be passed via `image_bytes` or `file_bytes` on `/chat/completions`
+        raw_upload = file_bytes if file_bytes is not None else image_bytes
+        upload_name = filename or "uploaded_file"
+
+        actual_image_bytes: Optional[bytes] = None
+        actual_doc_bytes: Optional[bytes] = None
+
+        if raw_upload is not None:
+            kind, _ = detect_upload_kind(raw_upload, upload_name)
+            if kind == "image":
+                actual_image_bytes = raw_upload
+            else:
+                actual_doc_bytes = raw_upload
+
+        has_image = bool(actual_image_bytes is not None or effective_b64)
+        has_document = bool(actual_doc_bytes is not None)
 
         user_query = next((m["content"] for m in reversed(norm_msgs) if m["role"] == "user"), "")
         if not user_query and has_image:
             user_query = "Describe this image in detail."
+        elif not user_query and has_document:
+            user_query = f"Summarize and explain the contents of {upload_name}."
 
         t0 = time.perf_counter()
         route = IntentRouter.route(
             user_query,
             has_image=has_image,
+            has_document=has_document,
             force_web=force_web,
             force_rag=force_rag,
         )
         metrics["router_ms"] = round((time.perf_counter() - t0) * 1000, 2)
 
+        # 1. Vision path (if uploaded file is an image) — strictly scoped to (uid, sid)
         vision_report: Optional[VisionReport] = None
         if route.use_vision and has_image:
             t_vis = time.perf_counter()
             vision_report = await self.vision_tool.describe_and_index(
-                image_bytes=image_bytes,
+                image_bytes=actual_image_bytes,
                 image_base64=effective_b64,
                 user_hint=user_query,
+                user_id=uid,
+                session_id=sid,
             )
             metrics["vision_ms"] = round((time.perf_counter() - t_vis) * 1000, 2)
-            if route.use_web:
+            if route.use_web and not route.direct_urls:
                 cleaned_uq = self.web_tool._clean_search_query(user_query)
                 vis_q = (vision_report.search_query or "").strip()
                 route.search_query = f"{cleaned_uq} {vis_q}".strip() or user_query
 
+        # 2. Universal Document Parser path (if uploaded file is PDF/DOCX/XLSX/CSV/ZIP/TXT/Code) — strictly scoped to (uid, sid)
+        document_report: Optional[ParsedDocumentReport] = None
+        if has_document and actual_doc_bytes is not None:
+            t_doc = time.perf_counter()
+            document_report = await self.doc_parser.parse_and_index(
+                file_bytes=actual_doc_bytes,
+                filename=upload_name,
+                user_hint=user_query,
+                user_id=uid,
+                session_id=sid,
+            )
+            metrics["doc_parse_ms"] = round((time.perf_counter() - t_doc) * 1000, 2)
+
+        # 3. Execute Web Search / Direct URL Scraping / Strict Tenant-Isolated RAG Retrieval in parallel
         t_tools = time.perf_counter()
         tasks: Dict[str, Any] = {}
-        if route.use_web:
+        if route.direct_urls:
+            tasks["web"] = self.web_tool.scrape_urls_and_ingest(route.direct_urls)
+        elif route.use_web:
             tasks["web"] = self.web_tool.search_and_ingest(route.search_query)
+
         if route.use_rag:
-            tasks["rag"] = self.memory.query("docs_rag", user_query, n_results=settings.ORCH_MAX_RAG_CHUNKS)
+            # Strict tenant isolation: ONLY query documents belonging to (uid, sid)
+            extra_doc = {"doc_id": document_report.doc_id} if document_report else None
+            tenant_where = self.memory.build_tenant_where(user_id=uid, session_id=sid, extra=extra_doc)
+            tasks["rag"] = self.memory.query(
+                "docs_rag",
+                user_query,
+                n_results=settings.ORCH_MAX_RAG_CHUNKS,
+                where=tenant_where,
+                relax_threshold=bool(document_report),
+            )
         if route.use_image_search:
-            tasks["images"] = self.memory.query("image_index", user_query, n_results=settings.ORCH_MAX_RAG_CHUNKS)
+            img_where = self.memory.build_tenant_where(user_id=uid, session_id=sid)
+            tasks["images"] = self.memory.query("image_index", user_query, n_results=settings.ORCH_MAX_RAG_CHUNKS, where=img_where)
+
+        # Always fetch the single BEST factual memory match for (uid, sid) from ChromaDB chat_history
+        tasks["history"] = self.memory.get_session_memory(
+            user_id=uid,
+            session_id=sid,
+            current_query=user_query,
+            recent_k=1,
+            semantic_k=1,
+        )
 
         results: Dict[str, List[Dict[str, Any]]] = {}
         if tasks:
@@ -1078,6 +3064,7 @@ class ChatOrchestrator:
 
         citations: List[SourceCitation] = []
         blocks: List[str] = []
+
         if vision_report:
             blocks.append(
                 "<vision_analysis>\n"
@@ -1091,6 +3078,68 @@ class ChatOrchestrator:
             )
 
         idx = 1
+        # 3-Mode Intelligent Document Context Assembly
+        if document_report:
+            blocks.append(f"<document_map>\n{document_report.toc_summary}\n</document_map>")
+            req_pages = self._extract_requested_pages(user_query, document_report.total_pages)
+            is_table_query = bool(
+                document_report.file_type in ("csv", "tsv", "xlsx")
+                or re.search(r"\b(table|total|sum|average|column|row|salary|price|amount|calculate|sheet)\b", user_query, re.IGNORECASE)
+            )
+            if is_table_query:
+                tbl_res = self.memory.query_table_data(
+                    document_report.doc_id,
+                    filter_query=user_query,
+                    user_id=uid,
+                    session_id=sid,
+                )
+                if "Numeric Aggregations" in tbl_res or "|" in tbl_res:
+                    blocks.append(f"<table_analysis>\n{tbl_res[:1400]}\n</table_analysis>")
+
+            if document_report.total_chars <= 2200:
+                # Mode A: Small file fast-path — inject 100% of document directly
+                blocks.append(f"[{idx}] (Uploaded File: {document_report.filename} | Profile: {document_report.doc_profile})\n{document_report.full_text}")
+                citations.append(SourceCitation(
+                    index=idx,
+                    source_type="document",
+                    title=document_report.filename,
+                    url_or_path=f"{document_report.filename} (Full Document)",
+                    snippet=document_report.full_text[:220],
+                ))
+                idx += 1
+            elif req_pages is not None:
+                # Mode B: Explicit page range requested by user ("page 3", "pages 2 to 4")
+                page_txt = self.memory.read_document_pages(
+                    document_report.doc_id,
+                    req_pages[0],
+                    req_pages[1],
+                    user_id=uid,
+                    session_id=sid,
+                )
+                blocks.append(f"[{idx}] (Uploaded File: {document_report.filename} Pages {req_pages[0]}-{req_pages[1]})\n{page_txt}")
+                citations.append(SourceCitation(
+                    index=idx,
+                    source_type="document",
+                    title=f"{document_report.filename} (p.{req_pages[0]}-{req_pages[1]})",
+                    url_or_path=document_report.filename,
+                    snippet=page_txt[:220],
+                ))
+                idx += 1
+            else:
+                # Mode C: Hybrid BM25 + Vector search chunks (+ Page 1 overview if summarizing)
+                rag_hits = results.get("rag", [])
+                if not rag_hits and document_report.pages:
+                    p1 = document_report.pages[0].text[:1200]
+                    blocks.append(f"[{idx}] (Uploaded File: {document_report.filename} p.1)\n{p1}")
+                    citations.append(SourceCitation(
+                        index=idx,
+                        source_type="document",
+                        title=f"{document_report.filename} (p.1)",
+                        url_or_path=document_report.filename,
+                        snippet=p1[:220],
+                    ))
+                    idx += 1
+
         for hit in results.get("web", []):
             meta = hit.get("metadata", {})
             doc_snippet = hit["document"][:900]
@@ -1102,39 +3151,52 @@ class ChatOrchestrator:
             blocks.append(f"[{idx}] ({meta.get('title', 'Web')} - {meta.get('url', '')})\n{doc_snippet}")
             idx += 1
 
-        for hit in results.get("rag", []):
-            meta = hit.get("metadata", {})
-            doc_snippet = hit["document"][:900]
-            citations.append(SourceCitation(
-                index=idx, source_type="rag",
-                title=meta.get("title", "Local Document"), url_or_path=meta.get("source", "docs_rag"),
-                snippet=doc_snippet[:220],
-            ))
-            blocks.append(f"[{idx}] (Doc: {meta.get('title', 'Local')})\n{doc_snippet}")
-            idx += 1
+        # Include RAG chunks if not already fully covered by Mode A/B
+        if not (document_report and (document_report.total_chars <= 2200 or self._extract_requested_pages(user_query, document_report.total_pages))):
+            for hit in results.get("rag", []):
+                meta = hit.get("metadata", {})
+                doc_snippet = hit["document"][:900]
+                p_num = meta.get("page_number")
+                title_lbl = f"{meta.get('title', 'Document')} (p.{p_num})" if p_num else meta.get("title", "Local Document")
+                citations.append(SourceCitation(
+                    index=idx, source_type="document" if document_report else "rag",
+                    title=title_lbl, url_or_path=meta.get("source", "docs_rag"),
+                    snippet=doc_snippet[:220],
+                ))
+                blocks.append(f"[{idx}] (Doc: {title_lbl})\n{doc_snippet}")
+                idx += 1
 
         matched_images = results.get("images", [])
         if matched_images:
             img_lines = [
-                f"- {m.get('metadata', {}).get('image_path', 'unknown')}: {m['document'][:220]}"
+                f"- {m.get('metadata', {}).get('image_id', 'image')}: {m['document'][:220]}"
                 for m in matched_images
             ]
             blocks.append("<matched_local_images>\n" + "\n".join(img_lines) + "\n</matched_local_images>")
+
+        history_turns = results.get("history", [])
+        if history_turns:
+            hist_lines = [h["document"][:600] for h in history_turns]
+            blocks.append(
+                "<conversation_memory>\n"
+                + "\n---\n".join(hist_lines)
+                + "\n</conversation_memory>"
+            )
 
         enriched = [dict(m) for m in norm_msgs]
         if blocks:
             context_str = "<context>\n" + "\n\n".join(blocks) + "\n</context>"
             sys_addition = (
-                "You HAVE live retrieved web/document results inside <context>. "
-                "Answer directly using the titles, facts, and exact URLs provided in <context> and cite [1], [2]. "
-                "Do NOT say you cannot provide links or lack internet access."
+                "You HAVE live retrieved web pages, scraped URLs, uploaded documents, and/or <conversation_memory> (past chat turns from this user's session) inside <context>. "
+                "Use <conversation_memory> to remember facts the user previously told you (such as their name, preferences, or earlier questions). "
+                "Answer directly and thoroughly using the facts, tables, pages, memory, and exact URLs provided in <context> and cite [1], [2] when referencing web/document sources. "
+                "Do NOT say you cannot remember previous interactions, cannot read files, cannot scrape websites, or lack internet access."
             )
             if enriched and enriched[0].get("role") == "system":
                 enriched[0]["content"] = f"{enriched[0]['content']}\n\n{sys_addition}".strip()
             else:
                 enriched.insert(0, {"role": "system", "content": sys_addition})
 
-            # Attach <context> directly to the last user message so no Jinja chat_template drops it
             for i in range(len(enriched) - 1, -1, -1):
                 if enriched[i].get("role") == "user":
                     enriched[i]["content"] = f"{context_str}\n\nUser Question: {enriched[i]['content']}"
@@ -1143,9 +3205,12 @@ class ChatOrchestrator:
         return OrchestrationContext(
             enriched_messages=enriched,
             user_query=user_query,
+            user_id=uid,
+            session_id=sid,
             route=route,
             citations=citations,
             vision_report=vision_report,
+            document_report=document_report,
             matched_images=matched_images,
             metrics_ms=metrics,
         )

@@ -2,6 +2,7 @@ from contextlib import asynccontextmanager
 import asyncio
 import os
 from fastapi import FastAPI, HTTPException, status, Request, applications
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -124,11 +125,15 @@ async def http_exception_handler(request: Request, exc: HTTPException):
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Centralized handler for request validation errors."""
-    logger.warning(f"[VALIDATION_ERROR] {request.url.path}: {exc.errors()}")
+    """Centralized handler for request validation errors (safely encodes non-serializable ctx exceptions)."""
+    safe_errors = jsonable_encoder(
+        exc.errors(),
+        custom_encoder={Exception: lambda e: str(e)},
+    )
+    logger.warning(f"[VALIDATION_ERROR] {request.url.path}: {safe_errors}")
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-        content={"error": "REQUEST_VALIDATION_ERROR", "detail": exc.errors()},
+        content={"error": "REQUEST_VALIDATION_ERROR", "detail": safe_errors},
     )
 
 
@@ -170,13 +175,15 @@ async def value_error_handler(request: Request, exc: ValueError):
 @app.middleware("http")
 async def kill_switch_middleware(request: Request, call_next):
     """Global middleware for emergency kill switch (Maintenance Mode)"""
-    # Whitelist System and Documentation endpoints
+    # Whitelist System and Documentation endpoints (including offline Swagger /assets)
     path = request.url.path
     is_whitelisted = (
-        path == "/health" or 
-        path.startswith("/docs") or 
-        path.startswith("/redoc") or 
-        path.startswith("/openapi.json")
+        path == "/health"
+        or path == "/reset-kill-switch"
+        or path.startswith("/docs")
+        or path.startswith("/redoc")
+        or path.startswith("/openapi.json")
+        or path.startswith("/assets")
     )
     
     # Check both manual and automatic kill switches
@@ -223,6 +230,13 @@ app.add_middleware(SlowAPIMiddleware)
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["System"])
 async def health_check():
     """Simple health check endpoint for monitoring"""
-    return {"status": "healthy", "version": "0.0.1"}
+    return {"status": "healthy", "version": "0.0.1", "auto_kill_enabled": app.state.auto_kill_enabled}
+
+
+@app.post("/reset-kill-switch", status_code=status.HTTP_200_OK, tags=["System"])
+async def reset_kill_switch():
+    """Reset the automatic safety kill switch without restarting the server."""
+    app.state.auto_kill_enabled = False
+    return {"status": "ok", "auto_kill_enabled": False, "message": "Kill switch reset; service is active."}
 
 app.include_router(v1_router, prefix="/app/v1")

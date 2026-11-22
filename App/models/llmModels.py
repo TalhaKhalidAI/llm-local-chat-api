@@ -28,6 +28,8 @@ class ChatRequest(BaseModel):
     use_web: Optional[bool] = None
     use_rag: Optional[bool] = None
     image_base64: Optional[str] = None
+    user_id: Optional[str] = Field(default=None, description="Tenant user_id for strict ChromaDB & RAM isolation")
+    session_id: Optional[str] = Field(default=None, description="Per-user chat session_id for conversation/document scoping")
 
     @model_validator(mode="before")
     @classmethod
@@ -38,6 +40,10 @@ class ChatRequest(BaseModel):
             # Clean Swagger UI auto-generated dummy placeholders if left untouched
             if data.get("image_base64") == "string":
                 data["image_base64"] = None
+            if data.get("user_id") == "string":
+                data["user_id"] = None
+            if data.get("session_id") == "string":
+                data["session_id"] = None
             if data.get("tool_choice") == "string":
                 data["tool_choice"] = None
             if data.get("stop") == ["string"]:
@@ -54,6 +60,8 @@ class ChatRequest(BaseModel):
         json_schema_extra={
             "example": {
                 "model": "glm-4-9b-chat-IQ4_XS.gguf",
+                "user_id": None,
+                "session_id": None,
                 "messages": [
                     {"role": "system", "content": "You are a helpful AI assistant."},
                     {"role": "user", "content": "What is the latest news about Nvidia CEO Jensen Huang?"},
@@ -81,5 +89,7 @@ class ChatResponse(BaseModel):
     object: str = "chat.completion"
     created: int
     model: str
+    user_id: Optional[str] = None
+    session_id: Optional[str] = None
     choices: List[ChatChoice]
     usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
