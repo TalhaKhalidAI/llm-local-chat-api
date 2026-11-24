@@ -142,13 +142,17 @@ class Settings(BaseSettings):
         le=2.0,
         description="Max cosine distance threshold for ChromaDB retrieval"
     )
-    ORCH_VISION_MODEL: str = Field(
-        default="/mnt/llm_models/LLM_Models/Qwen2-VL-2B-Instruct-Q4_K_M.gguf",
-        description="Path to Qwen2-VL GGUF model"
+    VISION_MODEL_PATH: str = Field(
+        default="/mnt/llm_models/Vision_Models",
+        description="Dedicated directory containing Vision GGUF models and mmproj files (falls back to LLM_MODEL_PATH)"
     )
-    ORCH_VISION_MMPROJ: str = Field(
-        default="/mnt/llm_models/LLM_Models/mmproj-Qwen2-VL-2B-Instruct-f16.gguf",
-        description="Path to Qwen2-VL mmproj GGUF file"
+    ORCH_VISION_MODEL: str | None = Field(
+        default=None,
+        description="Optional default fallback path to Vision GGUF model"
+    )
+    ORCH_VISION_MMPROJ: str | None = Field(
+        default=None,
+        description="Optional default fallback path to Vision mmproj GGUF file"
     )
     ORCH_VISION_GPU_LAYERS: int = Field(
         default=0,

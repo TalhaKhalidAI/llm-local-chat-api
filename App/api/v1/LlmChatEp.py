@@ -9,6 +9,9 @@ from App.core.exceptions import (
     InvalidImageError,
     MissingRequestFieldError,
     ModelNotLoadedError,
+    VisionModelLoadError,
+    VisionModelNotFoundError,
+    VisionModelNotLoadedError,
 )
 from fastapi import APIRouter, Request, Depends, Query, File, Form, UploadFile
 from App.models.llmModels import ChatChoice, ChatMessage, ChatRequest, ChatResponse
@@ -249,6 +252,14 @@ async def _require_loaded_model(repo: llmChatRepo, requested_model: str | None =
     return active
 
 
+def _require_loaded_vision_model(orch: ChatOrchestrator) -> None:
+    """Ensure a vision model is resident in memory before processing image/OCR requests."""
+    if not orch.vision_tool.is_loaded():
+        raise VisionModelNotLoadedError(
+            "Vision model is not loaded. Please load a vision model first via POST /app/v1/vision/load_model."
+        )
+
+
 @llmRouter.post("/chat/completions")
 async def completion(
     req: Request,
@@ -290,6 +301,18 @@ async def completion(
         f"Chat request - Model: {request.model}, User: {tenant_user_id}, Session: {tenant_session_id}, "
         f"Messages: {len(request.messages)}, Upload: {uploaded_filename} ({uploaded_kind})"
     )
+
+    # Check if request includes image and ensure vision model is loaded
+    has_image_input = (uploaded_kind == "image") or bool(getattr(request, "image_base64", None))
+    if not has_image_input and request.messages:
+        for m in request.messages:
+            if isinstance(m.content, list):
+                for p in m.content:
+                    if isinstance(p, dict) and p.get("type") == "image_url":
+                        has_image_input = True
+                        break
+    if has_image_input:
+        _require_loaded_vision_model(_orchestrator)
 
     # ============================================
     # 1. ORCHESTRATION (RAG + WEB SEARCH + DIRECT URL SCRAPE + VISION + UNIVERSAL DOC PARSER)
@@ -849,6 +872,51 @@ async def test_web_search(
 
 
 # ============================================
+# VISION MODEL LIFECYCLE ENDPOINTS
+# ============================================
+
+@llmRouter.post("/vision/load_model")
+async def load_vision_model_endpoint(
+    model_name: str | None = Form(default=None, description="Optional vision GGUF model filename"),
+    mmproj_name: str | None = Form(default=None, description="Optional vision mmproj projector filename"),
+    gpu_layers: int | None = Form(default=None, description="GPU layers (0=CPU resident, -1=GPU)"),
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """Load a Vision GGUF model into memory and keep it resident for rapid subsequent OCR/vision inference."""
+    result = await orch.vision_tool.load_model(
+        model_name=model_name,
+        mmproj_name=mmproj_name,
+        gpu_layers=gpu_layers,
+    )
+    return {"status": "ok", "message": "Vision model loaded successfully", "data": result}
+
+
+@llmRouter.post("/vision/unload_model")
+async def unload_vision_model_endpoint(
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """Unload resident Vision model and free system memory."""
+    result = await orch.vision_tool.unload_model()
+    return {"status": "ok", "message": result.get("message", "Vision model unloaded"), "data": result}
+
+
+@llmRouter.get("/vision/models")
+async def list_vision_models_endpoint(
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """List available vision GGUF models and mmproj projectors strictly from VISION_MODEL_PATH."""
+    return orch.vision_tool.list_vision_models()
+
+
+@llmRouter.get("/vision/active_model")
+async def get_active_vision_model_endpoint(
+    orch: ChatOrchestrator = Depends(get_orchestrator),
+):
+    """Get the currently loaded resident vision model and status."""
+    return orch.vision_tool.get_active_model()
+
+
+# ============================================
 # IN-RAM IMAGE UPLOAD ENDPOINTS (NO DISK SAVE)
 # ============================================
 
@@ -859,14 +927,13 @@ MAX_IMAGE_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB RAM guard
 async def describe_uploaded_image(
     req: Request,
     image: UploadFile = File(..., description="Image file processed strictly in RAM"),
-    prompt: str = Form(default="", description="Optional question or focus hint for Qwen2-VL"),
+    prompt: str = Form(default="", description="Optional question or focus hint for Vision model"),
     user_id: str | None = Form(default=None),
     session_id: str | None = Form(default=None),
-    repo: llmChatRepo = Depends(get_repo),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
-    """Upload an image -> decode in RAM with Qwen2-VL-2B -> index in ChromaDB isolated by (user_id, session_id)."""
-    await _require_loaded_model(repo)
+    """Upload an image -> decode in RAM with resident Vision model -> index in ChromaDB isolated by (user_id, session_id)."""
+    _require_loaded_vision_model(orch)
     uid, sid = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
     image_bytes = await image.read()
     if not image_bytes:
@@ -918,6 +985,9 @@ async def chat_with_uploaded_image(
             raise InvalidFileError("Uploaded file is empty")
         if len(uploaded_bytes) > MAX_IMAGE_UPLOAD_BYTES:
             raise FileTooLargeError("Uploaded file exceeds 15MB limit")
+        up_kind, _ = detect_upload_kind(uploaded_bytes, uploaded_filename)
+        if up_kind == "image":
+            _require_loaded_vision_model(orch)
 
     sys_chain = _parse_system_prompts_chain(system_prompts)
     messages_chain: list[dict[str, str]] = []
@@ -1029,6 +1099,7 @@ async def chat_with_uploaded_code(
             or (code_file.content_type and code_file.content_type.startswith("image/"))
             or code_bytes[:8].startswith((b"\x89PNG", b"\xff\xd8\xff", b"GIF8", b"RIFF"))
         ):
+            _require_loaded_vision_model(orch)
             is_image_code = True
             logger.info(f"Code endpoint detected image file '{code_file.filename}'. Running In-RAM Vision OCR...")
             vision_report_obj = await orch.vision_tool.describe(

@@ -29,6 +29,21 @@ class ModelNotLoadedError(AppError):
     error_code = "MODEL_NOT_LOADED"
 
 
+class VisionModelNotLoadedError(AppError):
+    status_code = status.HTTP_400_BAD_REQUEST
+    error_code = "VISION_MODEL_NOT_LOADED"
+
+
+class VisionModelNotFoundError(AppError):
+    status_code = status.HTTP_404_NOT_FOUND
+    error_code = "VISION_MODEL_NOT_FOUND"
+
+
+class VisionModelLoadError(AppError):
+    status_code = status.HTTP_500_INTERNAL_SERVER_ERROR
+    error_code = "VISION_MODEL_LOAD_ERROR"
+
+
 class ModelNotFoundError(AppError):
     status_code = status.HTTP_404_NOT_FOUND
     error_code = "MODEL_NOT_FOUND"

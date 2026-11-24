@@ -74,6 +74,9 @@ from App.core.exceptions import (
     InvalidImageError,
     ModelNotFoundError,
     QueueFullError,
+    VisionModelLoadError,
+    VisionModelNotFoundError,
+    VisionModelNotLoadedError,
 )
 from App.core.settings import settings
 
@@ -2618,37 +2621,282 @@ class VisionDescriberTool:
         self._worker_task: Optional[asyncio.Task[None]] = None
         self._worker_lock = asyncio.Lock()
 
-    def _load_vlm_sync(self):
+        # Resident model state
+        self._vlm: Any = None
+        self._chat_handler: Any = None
+        self._grammar: Any = None
+        self._active_model_name: Optional[str] = None
+        self._active_mmproj_name: Optional[str] = None
+        self._active_model_path: Optional[str] = None
+        self._active_mmproj_path: Optional[str] = None
+        self._gpu_layers: int = settings.ORCH_VISION_GPU_LAYERS
+        self._lifecycle_lock = asyncio.Lock()
+
+    def is_loaded(self) -> bool:
+        """Returns True if a Vision model is resident in memory and ready for inference."""
+        return self._vlm is not None
+
+    def get_active_model(self) -> Dict[str, Any]:
+        """Return metadata for the currently active vision model."""
+        return {
+            "is_loaded": self.is_loaded(),
+            "model_name": self._active_model_name,
+            "mmproj_name": self._active_mmproj_name,
+            "model_path": self._active_model_path,
+            "mmproj_path": self._active_mmproj_path,
+            "gpu_layers": self._gpu_layers if self.is_loaded() else None,
+        }
+
+    @staticmethod
+    def _scan_vision_dir() -> Tuple[List[str], List[str]]:
+        """
+        Scan configured VISION_MODEL_PATH for GGUF models and mmproj files.
+        (Does not scan LLM_MODEL_PATH so standard LLMs like DeepSeek-R1 are never mistaken for vision models).
+        """
+        dirs_to_check: List[Path] = []
+        if getattr(settings, "VISION_MODEL_PATH", None):
+            dirs_to_check.append(Path(settings.VISION_MODEL_PATH))
+
+        models: List[str] = []
+        projectors: List[str] = []
+        seen_models: set[str] = set()
+        seen_projs: set[str] = set()
+
+        for d in dirs_to_check:
+            if not d.exists() or not d.is_dir():
+                continue
+            for f in sorted(d.iterdir()):
+                if not f.is_file() or not f.name.endswith(".gguf"):
+                    continue
+                name_lower = f.name.lower()
+                if "mmproj" in name_lower or "projector" in name_lower:
+                    if f.name not in seen_projs:
+                        seen_projs.add(f.name)
+                        projectors.append(f.name)
+                else:
+                    if f.name not in seen_models:
+                        seen_models.add(f.name)
+                        models.append(f.name)
+
+        return models, projectors
+
+    def list_vision_models(self) -> Dict[str, Any]:
+        """List available vision GGUF models and mmproj projectors on disk."""
+        models, projectors = self._scan_vision_dir()
+        return {
+            "models_directory": getattr(settings, "VISION_MODEL_PATH", None),
+            "models": models,
+            "projectors": projectors,
+            "active_model": self.get_active_model(),
+        }
+
+    def _resolve_model_and_mmproj(
+        self,
+        model_name: Optional[str] = None,
+        mmproj_name: Optional[str] = None,
+    ) -> Tuple[Path, Path]:
+        """Resolve absolute paths for model and mmproj from VISION_MODEL_PATH."""
+        clean_model_name = model_name.strip() if model_name and model_name.strip() else None
+        clean_mmproj_name = mmproj_name.strip() if mmproj_name and mmproj_name.strip() else None
+
+        # 1. Validation: If model is not a vision model, or if user passes the model file as mmproj
+        if clean_model_name and clean_mmproj_name and clean_model_name == clean_mmproj_name:
+            raise VisionModelNotFoundError(
+                f"Invalid configuration: 'model_name' and 'mmproj_name' cannot be the same file ('{clean_model_name}'). "
+                f"mmproj must be a multimodal projector (e.g. mmproj-Qwen2-VL-...). Available projectors: {self._scan_vision_dir()[1]}"
+            )
+
+        dirs_to_check: List[Path] = []
+        if getattr(settings, "VISION_MODEL_PATH", None):
+            dirs_to_check.append(Path(settings.VISION_MODEL_PATH))
+
+        # 1. Resolve Model
+        chosen_model_path: Optional[Path] = None
+        if clean_model_name:
+            for d in dirs_to_check:
+                p = d / clean_model_name
+                if p.is_file():
+                    chosen_model_path = p
+                    break
+            if not chosen_model_path:
+                p = Path(clean_model_name)
+                if p.is_file():
+                    chosen_model_path = p
+            if not chosen_model_path:
+                raise VisionModelNotFoundError(f"Vision model '{clean_model_name}' not found in {[str(d) for d in dirs_to_check]}")
+        else:
+            default_p = Path(settings.ORCH_VISION_MODEL) if settings.ORCH_VISION_MODEL else None
+            if default_p and default_p.is_file():
+                chosen_model_path = default_p
+            else:
+                models, _ = self._scan_vision_dir()
+                if models:
+                    for d in dirs_to_check:
+                        candidate = d / models[0]
+                        if candidate.is_file():
+                            chosen_model_path = candidate
+                            break
+            if not chosen_model_path or not chosen_model_path.is_file():
+                raise VisionModelNotFoundError(
+                    f"No vision model specified and no GGUF files found in {[str(d) for d in dirs_to_check]}."
+                )
+
+        # 2. Resolve mmproj
+        chosen_mmproj_path: Optional[Path] = None
+        if clean_mmproj_name:
+            for d in dirs_to_check:
+                p = d / clean_mmproj_name
+                if p.is_file():
+                    chosen_mmproj_path = p
+                    break
+            if not chosen_mmproj_path:
+                p = Path(clean_mmproj_name)
+                if p.is_file():
+                    chosen_mmproj_path = p
+            if not chosen_mmproj_path:
+                raise VisionModelNotFoundError(f"Vision mmproj '{clean_mmproj_name}' not found in {[str(d) for d in dirs_to_check]}")
+        else:
+            default_m = Path(settings.ORCH_VISION_MMPROJ) if settings.ORCH_VISION_MMPROJ else None
+            if default_m and default_m.is_file():
+                chosen_mmproj_path = default_m
+            else:
+                _, projectors = self._scan_vision_dir()
+                # Smart matching: match mmproj to chosen model name (e.g. Qwen2-VL -> mmproj-Qwen2-VL)
+                if projectors and chosen_model_path:
+                    m_stem = chosen_model_path.name.lower()
+                    for proj in projectors:
+                        p_lower = proj.lower()
+                        # Extract core family name (qwen2-vl, smolvlm, llava, etc.)
+                        for family in ["qwen2-vl", "qwen2.5-vl", "smolvlm", "llava", "minicpm", "moondream"]:
+                            if family in m_stem and family in p_lower:
+                                for d in dirs_to_check:
+                                    cand = d / proj
+                                    if cand.is_file():
+                                        chosen_mmproj_path = cand
+                                        break
+                                if chosen_mmproj_path:
+                                    break
+                        if chosen_mmproj_path:
+                            break
+                if not chosen_mmproj_path and projectors:
+                    for d in dirs_to_check:
+                        candidate = d / projectors[0]
+                        if candidate.is_file():
+                            chosen_mmproj_path = candidate
+                            break
+            if not chosen_mmproj_path or not chosen_mmproj_path.is_file():
+                raise VisionModelNotFoundError(
+                    f"No vision mmproj specified and no mmproj files found in {[str(d) for d in dirs_to_check]}."
+                )
+
+        return chosen_model_path, chosen_mmproj_path
+
+    def _load_vlm_sync(
+        self,
+        model_path: Path,
+        mmproj_path: Path,
+        gpu_layers: int,
+    ):
         import psutil
         from llama_cpp import Llama, LlamaGrammar
         from llama_cpp.llama_chat_format import MTMDChatHandler
 
         avail_mb = psutil.virtual_memory().available / (1024 * 1024)
-        if avail_mb < 2200:
+        if avail_mb < 2000:
             raise InsufficientMemoryError(
-                f"Not enough free RAM for Vision model ({avail_mb:.0f} MB free, need >= 2200 MB). "
+                f"Not enough free RAM for Vision model ({avail_mb:.0f} MB free, need >= 2000 MB). "
                 "Set LLM_CONTINUOUS_BATCH_SLOTS=1 or unload unused models."
             )
 
-        if not Path(settings.ORCH_VISION_MODEL).exists():
-            raise ModelNotFoundError(f"Vision model not found: {settings.ORCH_VISION_MODEL}")
-        if not Path(settings.ORCH_VISION_MMPROJ).exists():
-            raise ModelNotFoundError(f"Vision mmproj not found: {settings.ORCH_VISION_MMPROJ}")
+        if not model_path.exists():
+            raise VisionModelNotFoundError(f"Vision model not found: {model_path}")
+        if not mmproj_path.exists():
+            raise VisionModelNotFoundError(f"Vision mmproj not found: {mmproj_path}")
 
-        grammar = LlamaGrammar.from_json_schema(json.dumps(self.VISION_SCHEMA))
-        chat_handler = MTMDChatHandler(clip_model_path=settings.ORCH_VISION_MMPROJ)
-        vlm = Llama(
-            model_path=settings.ORCH_VISION_MODEL,
-            chat_handler=chat_handler,
-            n_ctx=min(settings.LLM_N_CTX, 2048),
-            n_batch=256,
-            n_gpu_layers=settings.ORCH_VISION_GPU_LAYERS,
-            n_threads=settings.LLM_N_THREADS,
-            use_mmap=settings.USE_MMAP,
-            use_mlock=settings.USE_MLOCK,
-            verbose=False,
-        )
-        return vlm, chat_handler, grammar
+        try:
+            grammar = LlamaGrammar.from_json_schema(json.dumps(self.VISION_SCHEMA))
+            chat_handler = MTMDChatHandler(clip_model_path=str(mmproj_path))
+            vlm = Llama(
+                model_path=str(model_path),
+                chat_handler=chat_handler,
+                n_ctx=min(settings.LLM_N_CTX, 2048),
+                n_batch=256,
+                n_gpu_layers=gpu_layers,
+                n_threads=settings.LLM_N_THREADS,
+                use_mmap=settings.USE_MMAP,
+                use_mlock=settings.USE_MLOCK,
+                verbose=False,
+            )
+            return vlm, chat_handler, grammar
+        except Exception as exc:
+            raise VisionModelLoadError(f"Failed to load vision model: {exc}")
+
+    async def load_model(
+        self,
+        model_name: Optional[str] = None,
+        mmproj_name: Optional[str] = None,
+        gpu_layers: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Load a Vision GGUF model into memory and keep it resident for rapid inference."""
+        async with self._lifecycle_lock:
+            # If already loaded with identical config, return early
+            m_path, p_path = self._resolve_model_and_mmproj(model_name, mmproj_name)
+            effective_layers = gpu_layers if gpu_layers is not None else settings.ORCH_VISION_GPU_LAYERS
+
+            if (
+                self.is_loaded()
+                and self._active_model_path == str(m_path)
+                and self._active_mmproj_path == str(p_path)
+                and self._gpu_layers == effective_layers
+            ):
+                logger.info(f"Vision model already resident: {m_path.name}")
+                return self.get_active_model()
+
+            # Unload existing model if any
+            if self.is_loaded():
+                await self.unload_model()
+
+            logger.info(f"Loading resident Vision model: {m_path.name} with {p_path.name} (gpu_layers={effective_layers})")
+            t0 = time.perf_counter()
+            vlm, chat_handler, grammar = await asyncio.to_thread(
+                self._load_vlm_sync, m_path, p_path, effective_layers
+            )
+            self._vlm = vlm
+            self._chat_handler = chat_handler
+            self._grammar = grammar
+            self._active_model_name = m_path.name
+            self._active_mmproj_name = p_path.name
+            self._active_model_path = str(m_path)
+            self._active_mmproj_path = str(p_path)
+            self._gpu_layers = effective_layers
+
+            load_ms = round((time.perf_counter() - t0) * 1000, 2)
+            logger.info(f"Vision model resident and ready in {load_ms}ms")
+            result = self.get_active_model()
+            result["load_ms"] = load_ms
+            return result
+
+    async def unload_model(self) -> Dict[str, Any]:
+        """Unload the resident Vision model and free RAM."""
+        async with self._lifecycle_lock:
+            if not self.is_loaded():
+                return {"message": "No vision model was loaded", "is_loaded": False}
+
+            prev_name = self._active_model_name
+            vlm = self._vlm
+            chat_handler = self._chat_handler
+
+            self._vlm = None
+            self._chat_handler = None
+            self._grammar = None
+            self._active_model_name = None
+            self._active_mmproj_name = None
+            self._active_model_path = None
+            self._active_mmproj_path = None
+
+            await asyncio.to_thread(self._unload_vlm_sync, vlm, chat_handler)
+            logger.info(f"Unloaded vision model '{prev_name}' and freed RAM")
+            return {"message": f"Successfully unloaded vision model '{prev_name}'", "is_loaded": False}
 
     @staticmethod
     def _infer_vlm_sync(vlm: Any, grammar: Any, data_uri: str, user_hint: str) -> str:
@@ -2702,62 +2950,42 @@ class VisionDescriberTool:
                 self._worker_task = asyncio.create_task(self._vision_worker())
 
     async def _run_batch(self, batch: list[tuple[str, str, asyncio.Future[str]]], swap_vram: bool) -> None:
-        prev_model: Optional[str] = None
-        if swap_vram:
-            loaded = await self.llm.get_loaded_models()
-            prev_model = loaded[0] if loaded else None
-            if prev_model:
-                logger.info(f"Pausing AsyncLLM model '{prev_model}' for GPU Vision batch ({len(batch)} image(s))")
-                if hasattr(self.llm, "shutdown"):
-                    await self.llm.shutdown()
-                else:
-                    await self.llm.stop()
-                    await self.llm.unload_all_models()
-        else:
-            logger.info(f"Running CPU-only Vision batch ({len(batch)} image(s)); AsyncLLM stays loaded in VRAM")
-
-        vlm = chat_handler = grammar = None
-        try:
-            vlm, chat_handler, grammar = await asyncio.to_thread(self._load_vlm_sync)
-            idx = 0
-            while idx < len(batch):
-                data_uri, user_hint, fut = batch[idx]
-                idx += 1
-                try:
-                    if not fut.done():
-                        raw_json = await asyncio.to_thread(
-                            self._infer_vlm_sync, vlm, grammar, data_uri, user_hint
-                        )
-                        fut.set_result(raw_json)
-                except Exception as exc:
-                    if not fut.done():
-                        fut.set_exception(exc)
-                finally:
-                    self._queue.task_done()
-
-                while not self._queue.empty():
-                    try:
-                        batch.append(self._queue.get_nowait())
-                    except asyncio.QueueEmpty:
-                        break
-        except Exception as load_exc:
+        if not self.is_loaded():
+            exc = VisionModelNotLoadedError(
+                "No Vision model is loaded. Please load a vision model first via POST /app/v1/vision/load_model."
+            )
             for _, _, fut in batch:
                 if not fut.done():
-                    fut.set_exception(load_exc)
+                    fut.set_exception(exc)
                 try:
                     self._queue.task_done()
                 except ValueError:
                     pass
-        finally:
-            if vlm is not None or chat_handler is not None:
-                await asyncio.to_thread(self._unload_vlm_sync, vlm, chat_handler)
-            if prev_model:
-                logger.info(f"Restoring AsyncLLM model '{prev_model}'")
-                if hasattr(self.llm, "initialize"):
-                    await self.llm.initialize(model_name=prev_model)
-                else:
-                    await self.llm._load_model(model_name=prev_model)
-                    await self.llm.start()
+            return
+
+        vlm = self._vlm
+        grammar = self._grammar
+        idx = 0
+        while idx < len(batch):
+            data_uri, user_hint, fut = batch[idx]
+            idx += 1
+            try:
+                if not fut.done():
+                    raw_json = await asyncio.to_thread(
+                        self._infer_vlm_sync, vlm, grammar, data_uri, user_hint
+                    )
+                    fut.set_result(raw_json)
+            except Exception as exc:
+                if not fut.done():
+                    fut.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
+            while not self._queue.empty():
+                try:
+                    batch.append(self._queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
 
     async def _vision_worker(self) -> None:
         while True:
@@ -2769,11 +2997,42 @@ class VisionDescriberTool:
                 except asyncio.QueueEmpty:
                     break
 
-            if settings.ORCH_VISION_GPU_LAYERS == 0:
+            if self._gpu_layers == 0:
                 await self._run_batch(batch, swap_vram=False)
             else:
                 async with self.vram_gate:
                     await self._run_batch(batch, swap_vram=True)
+
+    async def describe(
+        self,
+        image_bytes: Optional[bytes] = None,
+        image_base64: Optional[str] = None,
+        user_hint: str = "",
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+    ) -> VisionReport:
+        """Run OCR / visual description without indexing into ChromaDB."""
+        if not self.is_loaded():
+            raise VisionModelNotLoadedError(
+                "No Vision model is loaded. Please load a vision model first via POST /app/v1/vision/load_model."
+            )
+        if image_bytes is not None:
+            data_uri, mime_type = bytes_to_data_uri(image_bytes)
+        elif image_base64:
+            data_uri, mime_type = base64_to_data_uri(image_base64)
+        else:
+            raise InvalidImageError("Either uploaded image_bytes or image_base64 is required")
+
+        await self._ensure_worker()
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[str] = loop.create_future()
+        try:
+            self._queue.put_nowait((data_uri, user_hint, fut))
+        except asyncio.QueueFull:
+            raise QueueFullError("Vision queue is full (max 10 pending images). Please retry shortly.")
+
+        raw_json = await asyncio.wait_for(fut, timeout=settings.DEFAULT_TIMEOUT)
+        return VisionReport.model_validate_json(raw_json)
 
     async def describe_and_index(
         self,
@@ -2783,7 +3042,11 @@ class VisionDescriberTool:
         user_id: str = "default_user",
         session_id: str = "default_session",
     ) -> VisionReport:
-        """Enqueue uploaded image in RAM -> Qwen2-VL-2B queue -> ChromaDB image_index scoped to (user_id, session_id)."""
+        """Enqueue uploaded image in RAM -> resident Vision model queue -> ChromaDB image_index scoped to (user_id, session_id)."""
+        if not self.is_loaded():
+            raise VisionModelNotLoadedError(
+                "No Vision model is loaded. Please load a vision model first via POST /app/v1/vision/load_model."
+            )
         if image_bytes is not None:
             data_uri, mime_type = bytes_to_data_uri(image_bytes)
             hash_source: bytes | str = image_bytes
@@ -3106,6 +3369,11 @@ class ChatOrchestrator:
         # 1. Vision path (if uploaded file is an image) — strictly scoped to (uid, sid)
         vision_report: Optional[VisionReport] = None
         if route.use_vision and has_image:
+            if not self.vision_tool.is_loaded():
+                raise VisionModelNotLoadedError(
+                    "Image/vision processing requested, but no Vision model is loaded. "
+                    "Please load a vision model first via POST /app/v1/vision/load_model."
+                )
             t_vis = time.perf_counter()
             vision_report = await self.vision_tool.describe_and_index(
                 image_bytes=actual_image_bytes,
