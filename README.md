@@ -180,6 +180,10 @@ Swagger UI is available offline at `http://localhost:8000/docs`.
 | POST | `/app/v1/unload_model` | Unload the active model and release VRAM/RAM |
 | GET | `/app/v1/active_model` | Inspect the currently loaded model, continuous batching slots, and memory usage |
 | GET | `/app/v1/models` | List all `.gguf` models available in `LLM_MODEL_PATH` |
+| POST | `/app/v1/vision/load_model` | Load a Vision GGUF model + mmproj projector into memory (kept resident for ~1.5s rapid OCR/inference) |
+| POST | `/app/v1/vision/unload_model` | Unload resident Vision model and free system memory |
+| GET | `/app/v1/vision/models` | List available vision `.gguf` models and `mmproj` projectors strictly in `VISION_MODEL_PATH` |
+| GET | `/app/v1/vision/active_model` | Get status, active model/mmproj names, and paths for currently resident vision model |
 | POST | `/app/v1/chat/completions` | OpenAI-compatible chat completion supporting JSON or `multipart/form-data` (`request` JSON + optional `image`/document upload), strict tenant isolation (`user_id`, `session_id`), RAG, live web search, tool calls, GBNF structured outputs, and SSE streaming |
 | POST | `/app/v1/vision/describe` | Upload an image (processed 100% in RAM) to get a structured `VisionReport` + OCR and index it in ChromaDB |
 | POST | `/app/v1/chat/completions/upload` | Dedicated multipart upload endpoint for chatting with uploaded files/images/documents (PDF, DOCX, XLSX, CSV, ZIP, Code) with chained JSON `system_prompts` and tenant isolation |
@@ -259,7 +263,31 @@ curl -X POST "http://localhost:8000/app/v1/vision/describe" \
   -F "prompt=Extract all visible text and describe the scene"
 ```
 
-### 5. Polyglot AST Coding & Repository Analysis
+### 5. Vision Model Lifecycle (Resident In-RAM Loading)
+```bash
+# List available vision models in VISION_MODEL_PATH
+curl -X GET "http://localhost:8000/app/v1/vision/models"
+
+# Load Vision Model + mmproj into RAM (stays resident for ~1.5s rapid requests)
+curl -X POST "http://localhost:8000/app/v1/vision/load_model" \
+  -d "model_name=Qwen2-VL-2B-Instruct-Q4_K_M.gguf&mmproj_name=mmproj-Qwen2-VL-2B-Instruct-f16.gguf&gpu_layers=0"
+
+# Inspect Active Vision Model
+curl -X GET "http://localhost:8000/app/v1/vision/active_model"
+
+# Unload Vision Model to free RAM
+curl -X POST "http://localhost:8000/app/v1/vision/unload_model"
+```
+
+### 6. Cluster / Multi-Node Disaggregated Vision Architecture
+For low-end hardware or GPU clusters, you can run Text LLMs on Node 1 and Vision on Node 2:
+- On Node 1 (Text API), set in `.env`:
+  ```bash
+  VISION_API_URL=http://node2-vision-server:8000/app/v1/vision/describe
+  ```
+- When a user uploads an image, Node 1 checks if a local vision model is loaded. If not, it automatically forwards the image in RAM to Node 2, indexes the remote OCR result in local ChromaDB, and passes context directly to the active LLM.
+
+### 7. Polyglot AST Coding & Repository Analysis
 ```bash
 curl -X POST "http://localhost:8000/app/v1/chat/completions/code" \
   -F "code_file=@/path/to/repository_code.py;type=text/x-python" \
@@ -269,7 +297,7 @@ curl -X POST "http://localhost:8000/app/v1/chat/completions/code" \
   -F "session_id=coding_sess_42"
 ```
 
-### 6. Document & File Chat with Chained System Prompts
+### 8. Document & File Chat with Chained System Prompts
 ```bash
 curl -X POST "http://localhost:8000/app/v1/chat/completions/upload" \
   -F "image=@/path/to/financial_datasheet.xlsx" \
@@ -281,7 +309,7 @@ curl -X POST "http://localhost:8000/app/v1/chat/completions/upload" \
   -F "session_id=q3_report"
 ```
 
-### 7. Emergency Reset for Kill Switch
+### 9. Emergency Reset for Kill Switch
 ```bash
 curl -X POST "http://localhost:8000/reset-kill-switch"
 ```
@@ -351,9 +379,9 @@ llm-local-chat-api/
 | `ORCH_CHUNK_OVERLAP_CHARS` | No | `120` | Overlap between consecutive chunks |
 | `ORCH_MAX_RAG_CHUNKS` | No | `3` | Maximum chunks injected into `<context>` per query |
 | `ORCH_MAX_DISTANCE` | No | `0.65` | Maximum cosine distance threshold for vector search hits |
-| `ORCH_VISION_MODEL` | No | `/mnt/llm_models/LLM_Models/Qwen2-VL-2B-Instruct-Q4_K_M.gguf` | Path to Qwen2-VL GGUF model |
-| `ORCH_VISION_MMPROJ` | No | `/mnt/llm_models/LLM_Models/mmproj-Qwen2-VL-2B-Instruct-f16.gguf` | Path to Qwen2-VL multimodal projector GGUF |
-| `ORCH_VISION_GPU_LAYERS` | No | `0` | GPU layers for Vision helper (`0` keeps Vision on CPU so active chat LLM stays in VRAM) |
+| `VISION_MODEL_PATH` | No | `/mnt/llm_models/LLM_Models/Vision_Models` | Dedicated directory containing Vision `.gguf` models and `mmproj` files |
+| `VISION_API_URL` | No | - | Optional remote Vision API endpoint (e.g. `http://vision-node:8000/app/v1/vision/describe`) for multi-node clusters |
+| `ORCH_VISION_GPU_LAYERS` | No | `0` | GPU layers for Vision model (`0` keeps Vision on CPU so active chat LLM stays in VRAM; `-1` for GPU) |
 
 ---
 
