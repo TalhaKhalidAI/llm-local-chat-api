@@ -146,6 +146,10 @@ class Settings(BaseSettings):
         default="/mnt/llm_models/Vision_Models",
         description="Dedicated directory containing Vision GGUF models and mmproj files (falls back to LLM_MODEL_PATH)"
     )
+    VISION_API_URL: str | None = Field(
+        default=None,
+        description="Optional remote vision API URL (e.g. http://192.168.1.50:8000/app/v1/vision/describe) when running vision on a separate machine"
+    )
     ORCH_VISION_MODEL: str | None = Field(
         default=None,
         description="Optional default fallback path to Vision GGUF model"

@@ -74,6 +74,7 @@ from App.core.exceptions import (
     InvalidImageError,
     ModelNotFoundError,
     QueueFullError,
+    RemoteVisionApiError,
     VisionModelLoadError,
     VisionModelNotFoundError,
     VisionModelNotLoadedError,
@@ -3003,6 +3004,78 @@ class VisionDescriberTool:
                 async with self.vram_gate:
                     await self._run_batch(batch, swap_vram=True)
 
+    async def _call_remote_vision_api(
+        self,
+        endpoint_url: str,
+        image_bytes: Optional[bytes] = None,
+        image_base64: Optional[str] = None,
+        user_hint: str = "",
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+    ) -> VisionReport:
+        """Call a remote Vision API (/app/v1/vision/describe) when running vision on a separate machine."""
+        import httpx
+
+        # Prepare raw bytes for upload
+        raw_bytes: bytes
+        if image_bytes is not None:
+            raw_bytes = image_bytes
+        elif image_base64:
+            if "," in image_base64:
+                _, _, b64_part = image_base64.partition(",")
+            else:
+                b64_part = image_base64
+            raw_bytes = base64.b64decode(b64_part)
+        else:
+            raise InvalidImageError("Either uploaded image_bytes or image_base64 is required")
+
+        url = endpoint_url.strip()
+        if not url.endswith("/describe") and not url.endswith("/"):
+            url = f"{url}/app/v1/vision/describe"
+        elif url.endswith("/"):
+            url = f"{url}app/v1/vision/describe"
+
+        files = {"image": ("image.png", raw_bytes, "image/png")}
+        data = {
+            "prompt": user_hint,
+            "user_id": user_id,
+            "session_id": session_id,
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                res = await client.post(url, data=data, files=files)
+        except Exception as conn_err:
+            raise RemoteVisionApiError(
+                f"Failed to connect to remote Vision API at '{url}': {conn_err}"
+            )
+
+        if res.status_code == 400:
+            err_data = {}
+            try:
+                err_data = res.json()
+            except Exception:
+                pass
+            if err_data.get("error") == "VISION_MODEL_NOT_LOADED":
+                raise VisionModelNotLoadedError(
+                    f"Remote Vision API at '{url}' reports: Vision model is not loaded on that machine."
+                )
+            raise RemoteVisionApiError(f"Remote Vision API error ({res.status_code}): {res.text}")
+
+        if res.status_code != 200:
+            raise RemoteVisionApiError(
+                f"Remote Vision API at '{url}' returned status {res.status_code}: {res.text}"
+            )
+
+        try:
+            resp_json = res.json()
+            v_rep_dict = resp_json.get("vision_report", resp_json)
+            return VisionReport.model_validate(v_rep_dict)
+        except Exception as parse_err:
+            raise RemoteVisionApiError(
+                f"Invalid JSON returned from remote Vision API at '{url}': {parse_err}"
+            )
+
     async def describe(
         self,
         image_bytes: Optional[bytes] = None,
@@ -3011,10 +3084,21 @@ class VisionDescriberTool:
         user_id: str = "default_user",
         session_id: str = "default_session",
     ) -> VisionReport:
-        """Run OCR / visual description without indexing into ChromaDB."""
+        """Run OCR / visual description without indexing into ChromaDB (supports local or remote fallback via .env)."""
+        effective_url = (settings.VISION_API_URL or "").strip() or None
         if not self.is_loaded():
+            if effective_url:
+                return await self._call_remote_vision_api(
+                    endpoint_url=effective_url,
+                    image_bytes=image_bytes,
+                    image_base64=image_base64,
+                    user_hint=user_hint,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
             raise VisionModelNotLoadedError(
-                "No Vision model is loaded. Please load a vision model first via POST /app/v1/vision/load_model."
+                "No Vision model is loaded locally and no VISION_API_URL was configured in .env. "
+                "Please load a vision model via POST /app/v1/vision/load_model or set VISION_API_URL in .env."
             )
         if image_bytes is not None:
             data_uri, mime_type = bytes_to_data_uri(image_bytes)
@@ -3042,14 +3126,49 @@ class VisionDescriberTool:
         user_id: str = "default_user",
         session_id: str = "default_session",
     ) -> VisionReport:
-        """Enqueue uploaded image in RAM -> resident Vision model queue -> ChromaDB image_index scoped to (user_id, session_id)."""
+        """Enqueue uploaded image in RAM -> resident Vision model queue (or remote API from .env) -> ChromaDB image_index scoped to (user_id, session_id)."""
+        effective_url = (settings.VISION_API_URL or "").strip() or None
         if not self.is_loaded():
+            if effective_url:
+                report = await self._call_remote_vision_api(
+                    endpoint_url=effective_url,
+                    image_bytes=image_bytes,
+                    image_base64=image_base64,
+                    user_hint=user_hint,
+                    user_id=user_id,
+                    session_id=session_id,
+                )
+                # Index the remote result into local ChromaDB
+                hash_source: bytes | str
+                mime_type = "image/png"
+                if image_bytes is not None:
+                    hash_source = image_bytes
+                    _, mime_type = bytes_to_data_uri(image_bytes)
+                elif image_base64:
+                    hash_source = image_base64
+                    _, mime_type = base64_to_data_uri(image_base64)
+                else:
+                    hash_source = str(time.time())
+
+                try:
+                    await self.memory.index_image_report(
+                        hash_source,
+                        report,
+                        mime_type=mime_type,
+                        user_id=user_id,
+                        session_id=session_id,
+                    )
+                except Exception as idx_err:
+                    logger.warning(f"ChromaDB image_index upsert failed for remote vision: {idx_err}")
+                return report
+
             raise VisionModelNotLoadedError(
-                "No Vision model is loaded. Please load a vision model first via POST /app/v1/vision/load_model."
+                "No Vision model is loaded locally and no VISION_API_URL was configured in .env. "
+                "Please load a vision model via POST /app/v1/vision/load_model or set VISION_API_URL in .env."
             )
         if image_bytes is not None:
             data_uri, mime_type = bytes_to_data_uri(image_bytes)
-            hash_source: bytes | str = image_bytes
+            hash_source = image_bytes
         elif image_base64:
             data_uri, mime_type = base64_to_data_uri(image_base64)
             hash_source = data_uri
@@ -3369,10 +3488,11 @@ class ChatOrchestrator:
         # 1. Vision path (if uploaded file is an image) — strictly scoped to (uid, sid)
         vision_report: Optional[VisionReport] = None
         if route.use_vision and has_image:
-            if not self.vision_tool.is_loaded():
+            effective_v_url = (settings.VISION_API_URL or "").strip() or None
+            if not self.vision_tool.is_loaded() and not effective_v_url:
                 raise VisionModelNotLoadedError(
-                    "Image/vision processing requested, but no Vision model is loaded. "
-                    "Please load a vision model first via POST /app/v1/vision/load_model."
+                    "Image/vision processing requested, but no Vision model is loaded locally and no VISION_API_URL was configured in .env. "
+                    "Please load a vision model via POST /app/v1/vision/load_model or set VISION_API_URL in .env."
                 )
             t_vis = time.perf_counter()
             vision_report = await self.vision_tool.describe_and_index(

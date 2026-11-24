@@ -253,10 +253,12 @@ async def _require_loaded_model(repo: llmChatRepo, requested_model: str | None =
 
 
 def _require_loaded_vision_model(orch: ChatOrchestrator) -> None:
-    """Ensure a vision model is resident in memory before processing image/OCR requests."""
-    if not orch.vision_tool.is_loaded():
+    """Ensure a vision model is resident in memory or VISION_API_URL is configured in settings/.env."""
+    effective_url = (settings.VISION_API_URL or "").strip() or None
+    if not orch.vision_tool.is_loaded() and not effective_url:
         raise VisionModelNotLoadedError(
-            "Vision model is not loaded. Please load a vision model first via POST /app/v1/vision/load_model."
+            "Vision model is not loaded locally and no VISION_API_URL was configured in .env. "
+            "Please load a vision model via POST /app/v1/vision/load_model or set VISION_API_URL in .env."
         )
 
 
@@ -302,7 +304,7 @@ async def completion(
         f"Messages: {len(request.messages)}, Upload: {uploaded_filename} ({uploaded_kind})"
     )
 
-    # Check if request includes image and ensure vision model is loaded
+    # Check if request includes image and ensure vision model is loaded (or remote url available)
     has_image_input = (uploaded_kind == "image") or bool(getattr(request, "image_base64", None))
     if not has_image_input and request.messages:
         for m in request.messages:

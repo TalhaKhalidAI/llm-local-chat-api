@@ -44,6 +44,11 @@ class VisionModelLoadError(AppError):
     error_code = "VISION_MODEL_LOAD_ERROR"
 
 
+class RemoteVisionApiError(AppError):
+    status_code = status.HTTP_502_BAD_GATEWAY
+    error_code = "REMOTE_VISION_API_ERROR"
+
+
 class ModelNotFoundError(AppError):
     status_code = status.HTTP_404_NOT_FOUND
     error_code = "MODEL_NOT_FOUND"
