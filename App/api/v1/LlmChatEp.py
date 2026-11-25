@@ -618,21 +618,6 @@ async def _execute_hybrid_react_loop(
     }
 
 
-def _parse_optional_tools_json(tools_raw: str | None) -> list[dict] | None:
-    """Safely parse an optional JSON string array/object of OpenAI tool schemas from multipart Form fields."""
-    if not tools_raw or not tools_raw.strip() or tools_raw.strip() in ("string", "null", "None"):
-        return None
-    try:
-        loaded = json.loads(tools_raw)
-        if isinstance(loaded, dict):
-            loaded = [loaded]
-        if isinstance(loaded, list) and loaded != [{"additionalProp1": {}}]:
-            return loaded
-    except Exception:
-        return None
-    return None
-
-
 @llmRouter.post("/chat/completions")
 async def completion(
     req: Request,
@@ -648,14 +633,6 @@ async def completion(
     max_agent_steps: int | None = Form(
         default=None,
         description="Optional Form override: Max ReAct agent hops (1..6) when agentic_mode=True",
-    ),
-    tools: str | None = Form(
-        default=None,
-        description="Optional Form override: JSON array of OpenAI tool definitions",
-    ),
-    tool_choice: str | None = Form(
-        default=None,
-        description="Optional Form override: tool_choice ('auto', 'none', 'required')",
     ),
     service: LlmService = Depends(get_repo),
 ):
@@ -674,11 +651,6 @@ async def completion(
             request.agentic_mode = agentic_mode
         if max_agent_steps is not None:
             request.max_agent_steps = max(1, min(int(max_agent_steps), 6))
-        form_tools = _parse_optional_tools_json(tools)
-        if form_tools is not None:
-            request.tools = form_tools
-        if tool_choice and tool_choice.strip() not in ("", "string", "null", "None"):
-            request.tool_choice = tool_choice.strip()
         if image is not None and image.filename:
             uploaded_bytes = await image.read()
             uploaded_filename = image.filename
@@ -1357,12 +1329,10 @@ async def describe_uploaded_image(
     session_id: str | None = Form(default=None),
     agentic_mode: bool = Form(
         default=False,
-        description="False = Pure Vision OCR/describe only; True = Run Vision OCR/describe AND chain autonomous ReAct agent tools (Web/Weather/RAG/Custom Tools) using the loaded LLM",
+        description="False = Pure Vision OCR/describe only; True = Run Vision OCR/describe AND chain autonomous ReAct agent tools (Web/Weather/RAG) using the loaded LLM",
     ),
     max_agent_steps: int = Form(default=3, description="Max ReAct agent hops when agentic_mode=True (1..6)"),
-    model: str | None = Form(default=None, description="Optional loaded LLM name when agentic_mode=True or tools are provided"),
-    tools: str | None = Form(default=None, description="Optional JSON array of OpenAI tool definitions"),
-    tool_choice: str | None = Form(default=None, description="Optional tool_choice ('auto', 'none', 'required')"),
+    model: str | None = Form(default=None, description="Optional loaded LLM name when agentic_mode=True"),
     temperature: float | None = Form(default=0.2),
     max_tokens: int | None = Form(default=512),
     service: LlmService = Depends(get_repo),
@@ -1390,11 +1360,8 @@ async def describe_uploaded_image(
     )
     vision_ms = round((time.perf_counter() - t_vis0) * 1000, 2)
 
-    parsed_tools = _parse_optional_tools_json(tools)
-    clean_tool_choice = tool_choice.strip() if (tool_choice and tool_choice.strip() not in ("", "string", "null", "None")) else None
-
     # Pure Vision mode (backwards-compatible for vision-only cluster nodes & standard /vision/describe callers)
-    if not agentic_mode and not parsed_tools:
+    if not agentic_mode:
         return {
             "status": "ok",
             "user_id": uid,
@@ -1403,7 +1370,7 @@ async def describe_uploaded_image(
             "metrics_ms": {"vision_ms": vision_ms},
         }
 
-    # Agentic / Tool-enabled Vision workflow (requires loaded text LLM)
+    # Agentic Vision workflow (requires loaded text LLM)
     clean_model = model.strip() if (model and model.strip() not in ("", "string", "null", "None")) else None
     active_model = await _require_loaded_model(service, clean_model)
     effective_question = prompt.strip() or f"Analyze this image ({report.summary}) and provide helpful insights."
@@ -1426,16 +1393,12 @@ async def describe_uploaded_image(
         user_id=uid,
         session_id=sid,
         model_name=active_model,
-        agentic_mode=agentic_mode,
+        agentic_mode=True,
     )
     orch_ctx.vision_report = report
     orch_ctx.user_query = f"{effective_question} (Image Summary: {report.summary} | Visible Text: {report.visible_text[:200]})"
 
-    active_vis_tools = (
-        _merge_agentic_and_client_tools(orch, parsed_tools, allow_web=True, allow_rag=True)
-        if agentic_mode
-        else parsed_tools
-    )
+    active_vis_tools = _merge_agentic_and_client_tools(orch, None, allow_web=True, allow_rag=True)
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
     t_ag0 = time.perf_counter()
     loop_res = await _execute_hybrid_react_loop(
@@ -1444,13 +1407,13 @@ async def describe_uploaded_image(
         orch_ctx=orch_ctx,
         base_messages=orch_ctx.enriched_messages,
         active_tools=active_vis_tools,
-        tool_choice=clean_tool_choice,
+        tool_choice=None,
         gen_kwargs=gen_kwargs,
         user_id=uid,
         session_id=sid,
-        max_steps=max_agent_steps if agentic_mode else 1,
-        is_agentic=agentic_mode,
-        client_tools=parsed_tools,
+        max_steps=max_agent_steps,
+        is_agentic=True,
+        client_tools=None,
     )
     agent_ms = round((time.perf_counter() - t_ag0) * 1000, 2)
 
@@ -1493,8 +1456,6 @@ async def chat_with_uploaded_image(
     max_agent_steps: int = Form(default=3, description="Max autonomous tool-calling iterations when agentic_mode=True (1..6)"),
     use_web: bool | None = Form(default=None),
     use_rag: bool | None = Form(default=None),
-    tools: str | None = Form(default=None, description="Optional JSON array of OpenAI tool definitions"),
-    tool_choice: str | None = Form(default=None, description="Optional tool_choice ('auto', 'none', 'required')"),
     temperature: float | None = Form(default=None),
     max_tokens: int | None = Form(default=None),
     service: LlmService = Depends(get_repo),
@@ -1525,24 +1486,11 @@ async def chat_with_uploaded_image(
         messages_chain.append({"role": "system", "content": combined_sys})
     messages_chain.append({"role": "user", "content": prompt})
 
-    parsed_tools: list[dict] | None = None
-    if tools and tools.strip() and tools.strip() not in ("string", "null", "None"):
-        try:
-            t_loaded = json.loads(tools)
-            if isinstance(t_loaded, dict):
-                t_loaded = [t_loaded]
-            if isinstance(t_loaded, list) and t_loaded != [{"additionalProp1": {}}]:
-                parsed_tools = t_loaded
-        except Exception:
-            parsed_tools = None
-    clean_tool_choice = tool_choice.strip() if (tool_choice and tool_choice.strip() not in ("", "string", "null", "None")) else None
-    effective_use_web = False if (use_web is None and parsed_tools and clean_tool_choice != "none" and not agentic_mode) else use_web
-
     orch_ctx = await orch.prepare_context(
         messages_chain,
         file_bytes=uploaded_bytes,
         filename=uploaded_filename,
-        force_web=effective_use_web,
+        force_web=use_web,
         force_rag=use_rag,
         user_id=uid,
         session_id=sid,
@@ -1550,19 +1498,15 @@ async def chat_with_uploaded_image(
         agentic_mode=agentic_mode,
     )
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
-    active_upload_tools = (
-        _merge_agentic_and_client_tools(
+
+    agent_trace: list[dict[str, Any]] | None = None
+    if agentic_mode:
+        active_upload_tools = _merge_agentic_and_client_tools(
             orch,
-            parsed_tools,
+            None,
             allow_web=(use_web is not False),
             allow_rag=(use_rag is not False),
         )
-        if agentic_mode
-        else parsed_tools
-    )
-
-    agent_trace: list[dict[str, Any]] | None = None
-    if agentic_mode or active_upload_tools:
         t_ag0 = time.perf_counter()
         loop_res = await _execute_hybrid_react_loop(
             service=service,
@@ -1570,20 +1514,19 @@ async def chat_with_uploaded_image(
             orch_ctx=orch_ctx,
             base_messages=orch_ctx.enriched_messages,
             active_tools=active_upload_tools,
-            tool_choice=clean_tool_choice,
+            tool_choice=None,
             gen_kwargs=gen_kwargs,
             user_id=uid,
             session_id=sid,
-            max_steps=max_agent_steps if agentic_mode else 1,
-            is_agentic=agentic_mode,
-            client_tools=parsed_tools,
+            max_steps=max_agent_steps,
+            is_agentic=True,
+            client_tools=None,
         )
         content = loop_res["content"]
         extracted_calls = loop_res["tool_calls"]
         finish_reason = loop_res["finish_reason"]
-        agent_trace = loop_res["agent_trace"] if agentic_mode else (loop_res["agent_trace"] or None)
-        if agentic_mode:
-            orch_ctx.metrics_ms["agent_loop_ms"] = round((time.perf_counter() - t_ag0) * 1000, 2)
+        agent_trace = loop_res["agent_trace"]
+        orch_ctx.metrics_ms["agent_loop_ms"] = round((time.perf_counter() - t_ag0) * 1000, 2)
     else:
         formatted_prompt = await service.format_messages_native(orch_ctx.enriched_messages)
         async with orch.vram_gate:
@@ -1643,11 +1586,9 @@ async def chat_with_uploaded_code(
     session_id: str | None = Form(default=None),
     agentic_mode: bool = Form(
         default=False,
-        description="False = Fast AST analysis; True = Multi-step ReAct Agentic mode with AST/RAG/Web/Custom Tools",
+        description="False = Fast AST analysis; True = Multi-step ReAct Agentic mode with AST/RAG/Web tools",
     ),
     max_agent_steps: int = Form(default=3, description="Max ReAct agent hops when agentic_mode=True (1..6)"),
-    tools: str | None = Form(default=None, description="Optional JSON array of OpenAI tool definitions"),
-    tool_choice: str | None = Form(default=None, description="Optional tool_choice ('auto', 'none', 'required')"),
     use_web: bool | None = Form(default=False),
     use_rag: bool | None = Form(default=True),
     temperature: float | None = Form(default=0.2),
@@ -1766,9 +1707,6 @@ async def chat_with_uploaded_code(
     user_content = f"{code_context_block}\n\nCoding Task / Question: {prompt}".strip() if code_context_block else prompt
     messages_chain.append({"role": "user", "content": user_content})
 
-    parsed_code_tools = _parse_optional_tools_json(tools)
-    clean_code_choice = tool_choice.strip() if (tool_choice and tool_choice.strip() not in ("", "string", "null", "None")) else None
-
     # Also allow retrieving previously uploaded code AST chunks or session memory in the same (uid, sid)
     orch_ctx = await orch.prepare_context(
         messages_chain,
@@ -1780,14 +1718,15 @@ async def chat_with_uploaded_code(
         agentic_mode=agentic_mode,
     )
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
-    active_code_tools = (
-        _merge_agentic_and_client_tools(orch, parsed_code_tools, allow_web=(use_web is not False or agentic_mode), allow_rag=(use_rag is not False))
-        if agentic_mode
-        else parsed_code_tools
-    )
     code_agent_trace: list[dict[str, Any]] | None = None
     code_tool_calls: list[dict] | None = None
-    if agentic_mode or active_code_tools:
+    if agentic_mode:
+        active_code_tools = _merge_agentic_and_client_tools(
+            orch,
+            None,
+            allow_web=(use_web is not False or agentic_mode),
+            allow_rag=(use_rag is not False),
+        )
         t_ag0 = time.perf_counter()
         loop_res = await _execute_hybrid_react_loop(
             service=service,
@@ -1795,21 +1734,20 @@ async def chat_with_uploaded_code(
             orch_ctx=orch_ctx,
             base_messages=orch_ctx.enriched_messages,
             active_tools=active_code_tools,
-            tool_choice=clean_code_choice,
+            tool_choice=None,
             gen_kwargs=gen_kwargs,
             user_id=uid,
             session_id=sid,
-            max_steps=max_agent_steps if agentic_mode else 1,
-            is_agentic=agentic_mode,
-            client_tools=parsed_code_tools,
+            max_steps=max_agent_steps,
+            is_agentic=True,
+            client_tools=None,
         )
         content = loop_res["content"]
         code_tool_calls = loop_res["tool_calls"]
         meta = {"finish_reason": loop_res["finish_reason"]}
         exact_usage = loop_res["usage"]
-        code_agent_trace = loop_res["agent_trace"] if agentic_mode else (loop_res["agent_trace"] or None)
-        if agentic_mode:
-            orch_ctx.metrics_ms["agent_loop_ms"] = round((time.perf_counter() - t_ag0) * 1000, 2)
+        code_agent_trace = loop_res["agent_trace"]
+        orch_ctx.metrics_ms["agent_loop_ms"] = round((time.perf_counter() - t_ag0) * 1000, 2)
     else:
         formatted_prompt = await service.format_messages_native(orch_ctx.enriched_messages)
         async with orch.vram_gate:

@@ -3033,14 +3033,20 @@ class VisionDescriberTool:
             raise VisionModelNotFoundError(f"Vision mmproj not found: {mmproj_path}")
 
         try:
+            use_vision_gpu = bool(gpu_layers != 0)
             grammar = LlamaGrammar.from_json_schema(json.dumps(self.VISION_SCHEMA))
-            chat_handler = MTMDChatHandler(clip_model_path=str(mmproj_path))
+            chat_handler = MTMDChatHandler(
+                clip_model_path=str(mmproj_path),
+                verbose=False,
+                use_gpu=use_vision_gpu,
+            )
             vlm = Llama(
                 model_path=str(model_path),
                 chat_handler=chat_handler,
                 n_ctx=min(settings.LLM_N_CTX, 2048),
                 n_batch=256,
                 n_gpu_layers=gpu_layers,
+                offload_kqv=use_vision_gpu,
                 n_threads=settings.LLM_N_THREADS,
                 use_mmap=settings.USE_MMAP,
                 use_mlock=settings.USE_MLOCK,

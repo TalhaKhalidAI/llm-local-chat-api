@@ -87,8 +87,6 @@ class ChatRequest(BaseModel):
                 "max_agent_steps": 3,
                 "use_web": True,
                 "use_rag": False,
-                "tools": None,
-                "tool_choice": None,
             }
         }
     )
