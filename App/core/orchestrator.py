@@ -3601,6 +3601,284 @@ class ChatOrchestrator:
         },
     )
 
+    AGENTIC_WEB_TOOLS = (
+        {
+            "type": "function",
+            "function": {
+                "name": "web_search",
+                "description": "Search the live internet and news for up-to-date facts, recent events, sports winners, prices, or public information.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "Focused search engine query"},
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Fetch real-time live weather (temperature, feels-like, humidity, wind speed, pressure) for any city or location.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string", "description": "City or place name, e.g. Lahore"},
+                    },
+                    "required": ["location"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "scrape_website",
+                "description": "Fetch and extract clean text/tables from a specific public http/https URL.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "url": {"type": "string", "description": "Full https:// URL to scrape"},
+                    },
+                    "required": ["url"],
+                },
+            },
+        },
+    )
+
+    AGENTIC_IMAGE_MEMORY_TOOL = {
+        "type": "function",
+        "function": {
+            "name": "search_images",
+            "description": "Search previously described/uploaded images and OCR text in the current user/session ChromaDB image_index.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Visual or OCR search keywords"},
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+    INTERNAL_TOOL_NAMES = frozenset({
+        "search_document",
+        "read_document_pages",
+        "query_table_data",
+        "inspect_page_visual",
+        "search_images",
+        "web_search",
+        "get_weather",
+        "scrape_website",
+    })
+
+    def get_agentic_tools(
+        self,
+        has_local_docs: bool = True,
+        allow_web: bool = True,
+        allow_vision: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Build the dynamic OpenAI tool schema list exposed to the LLM in `agentic_mode=True`."""
+        tools: List[Dict[str, Any]] = []
+        if has_local_docs:
+            for t in self.DEFAULT_DOCUMENT_TOOLS:
+                t_name = t["function"]["name"]
+                if t_name == "inspect_page_visual" and not allow_vision:
+                    continue
+                tools.append(t)
+        tools.append(self.AGENTIC_IMAGE_MEMORY_TOOL)
+        if allow_web:
+            tools.extend(self.AGENTIC_WEB_TOOLS)
+        return tools
+
+    async def execute_internal_tool_with_citations(
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        user_id: str = "default_user",
+        session_id: str = "default_session",
+        start_citation_idx: int = 1,
+    ) -> Tuple[str, List[SourceCitation]]:
+        """
+        Execute built-in document/web/weather tools strictly isolated to `(user_id, session_id)`
+        and return `(formatted_observation_text, new_citations)` with numbered `[idx]` tags.
+        """
+        new_cits: List[SourceCitation] = []
+        idx = start_citation_idx
+
+        if tool_name == "search_document":
+            q = str(arguments.get("query", "")).strip()
+            top_k = max(1, min(int(arguments.get("top_k", 3) or 3), 6))
+            doc_id = self.memory.get_tenant_doc_id(user_id=user_id, session_id=session_id, requested_doc_id=arguments.get("doc_id"))
+            extra = {"doc_id": doc_id} if doc_id else None
+            where = self.memory.build_tenant_where(user_id=user_id, session_id=session_id, extra=extra)
+            hits = await self.memory.query("docs_rag", q, n_results=top_k, where=where, relax_threshold=True)
+            if not hits:
+                return "No matching sections found in local documents for this user_id/session_id.", []
+            out_blocks: List[str] = []
+            for h in hits:
+                meta = h.get("metadata") or {}
+                p_num = meta.get("page_number")
+                title_lbl = f"{meta.get('title', 'Document')} (p.{p_num})" if p_num else meta.get("title", "Local Document")
+                snippet = h["document"][:900]
+                new_cits.append(SourceCitation(
+                    index=idx,
+                    source_type="rag",
+                    title=title_lbl,
+                    url_or_path=meta.get("source", "docs_rag"),
+                    snippet=snippet[:220],
+                ))
+                out_blocks.append(f"[{idx}] (Doc: {title_lbl})\n{snippet}")
+                idx += 1
+            return "\n\n".join(out_blocks), new_cits
+
+        if tool_name == "read_document_pages":
+            s_p = int(arguments.get("start_page", 1) or 1)
+            e_p = int(arguments.get("end_page", s_p) or s_p)
+            page_txt = self.memory.read_document_pages(
+                doc_id=arguments.get("doc_id"),
+                start_page=s_p,
+                end_page=e_p,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            if page_txt and "No uploaded document found" not in page_txt:
+                doc_id = self.memory.get_tenant_doc_id(user_id=user_id, session_id=session_id, requested_doc_id=arguments.get("doc_id"))
+                doc_obj = self.memory._active_docs.get(doc_id or "")
+                fname = doc_obj.filename if doc_obj else "Local Document"
+                new_cits.append(SourceCitation(
+                    index=idx,
+                    source_type="document",
+                    title=f"{fname} (p.{s_p}-{e_p})",
+                    url_or_path=fname,
+                    snippet=page_txt[:220],
+                ))
+                return f"[{idx}] ({fname} Pages {s_p}-{e_p})\n{page_txt}", new_cits
+            return page_txt, []
+
+        if tool_name == "query_table_data":
+            res_txt = self.memory.query_table_data(
+                doc_id=arguments.get("doc_id"),
+                sheet_or_table=str(arguments.get("sheet_or_table", "") or ""),
+                filter_query=str(arguments.get("filter") or arguments.get("query") or ""),
+                user_id=user_id,
+                session_id=session_id,
+            )
+            return res_txt, []
+
+        if tool_name == "inspect_page_visual":
+            doc_id = self.memory.get_tenant_doc_id(user_id=user_id, session_id=session_id, requested_doc_id=arguments.get("doc_id"))
+            page_num = int(arguments.get("page_num", 1) or 1)
+            question = str(arguments.get("question", "Describe the chart, diagram, or text on this page."))
+            raw_pdf = self.memory._active_raw_bytes.get(doc_id or "")
+            if not raw_pdf:
+                return "No raw PDF bytes available in RAM for your user/session.", []
+            jpg_bytes = await asyncio.to_thread(UniversalDocumentParser._render_pdf_page_to_jpeg_ram, raw_pdf, page_num)
+            if not jpg_bytes:
+                return f"Could not render page {page_num} to image in RAM.", []
+            v_rep = await self.vision_tool.describe_and_index(
+                image_bytes=jpg_bytes,
+                user_hint=question,
+                user_id=user_id,
+                session_id=session_id,
+            )
+            obs = (
+                f"[{idx}] [Page {page_num} Visual Inspection]\n"
+                f"Summary: {v_rep.summary}\n"
+                f"Details: {v_rep.subjects_and_details}\n"
+                f"Visible Text (OCR): {v_rep.visible_text}"
+            )
+            new_cits.append(SourceCitation(
+                index=idx,
+                source_type="vision",
+                title=f"Page {page_num} Visual OCR",
+                url_or_path=f"page_{page_num}",
+                snippet=v_rep.summary[:220],
+            ))
+            return obs, new_cits
+
+        if tool_name == "get_weather":
+            loc = str(arguments.get("location") or arguments.get("city") or arguments.get("query") or "").strip()
+            wx_hits = await asyncio.to_thread(DuckDuckGoWebTool._weather_search_sync, f"weather in {loc}")
+            if not wx_hits:
+                return f"Could not retrieve live weather for '{loc}'.", []
+            out_blocks = []
+            for w in wx_hits:
+                new_cits.append(SourceCitation(
+                    index=idx,
+                    source_type="web",
+                    title=w["title"],
+                    url_or_path=w["url"],
+                    snippet=w["snippet"][:220],
+                ))
+                out_blocks.append(f"[{idx}] ({w['title']} - {w['url']})\n{w['snippet']}")
+                idx += 1
+            return "\n\n".join(out_blocks), new_cits
+
+        if tool_name == "scrape_website":
+            url = str(arguments.get("url", "")).strip()
+            hits = await self.web_tool.scrape_urls_and_ingest([url])
+            if not hits:
+                return f"Could not scrape '{url}' (blocked by SSRF guard or unreachable).", []
+            out_blocks = []
+            for h in hits:
+                meta = h.get("metadata") or {}
+                snip = h["document"][:900]
+                new_cits.append(SourceCitation(
+                    index=idx,
+                    source_type="web",
+                    title=meta.get("title", url),
+                    url_or_path=meta.get("url", url),
+                    snippet=snip[:220],
+                ))
+                out_blocks.append(f"[{idx}] ({meta.get('title', 'Web')} - {meta.get('url', url)})\n{snip}")
+                idx += 1
+            return "\n\n".join(out_blocks), new_cits
+
+        if tool_name == "web_search":
+            q = str(arguments.get("query", "")).strip()
+            hits = await self.web_tool.search_and_ingest(q)
+            if not hits:
+                return f"No verified live web results found for '{q}'.", []
+            out_blocks = []
+            for h in hits:
+                meta = h.get("metadata") or {}
+                snip = h["document"][:900]
+                new_cits.append(SourceCitation(
+                    index=idx,
+                    source_type="web",
+                    title=meta.get("title", "Web Result"),
+                    url_or_path=meta.get("url", ""),
+                    snippet=snip[:220],
+                ))
+                out_blocks.append(f"[{idx}] ({meta.get('title', 'Web')} - {meta.get('url', '')})\n{snip}")
+                idx += 1
+            return "\n\n".join(out_blocks), new_cits
+
+        if tool_name == "search_images":
+            q = str(arguments.get("query", "")).strip()
+            where = self.memory.build_tenant_where(user_id=user_id, session_id=session_id)
+            hits = await self.memory.query("image_index", q, n_results=3, where=where, relax_threshold=True)
+            if not hits:
+                return "No matching images found in image_index for this user_id/session_id.", []
+            out_blocks = []
+            for h in hits:
+                meta = h.get("metadata") or {}
+                img_id = meta.get("image_id", "session_image")
+                snip = h["document"][:800]
+                new_cits.append(SourceCitation(
+                    index=idx,
+                    source_type="vision",
+                    title=f"Session Image ({img_id})",
+                    url_or_path=img_id,
+                    snippet=snip[:220],
+                ))
+                out_blocks.append(f"[{idx}] (Session Image {img_id})\n{snip}")
+                idx += 1
+            return "\n\n".join(out_blocks), new_cits
+
+        return f"Unknown internal tool '{tool_name}'.", []
+
     async def execute_internal_tool(
         self,
         tool_name: str,
@@ -3608,69 +3886,15 @@ class ChatOrchestrator:
         user_id: str = "default_user",
         session_id: str = "default_session",
     ) -> str:
-        """
-        Execute built-in document/web tools strictly isolated to the caller's `(user_id, session_id)`:
-          - Tool 1: `search_document(query, doc_id?, top_k=3)`
-          - Tool 2: `read_document_pages(start_page, end_page, doc_id?)`
-          - Tool 3: `query_table_data(filter, sheet_or_table?, doc_id?)`
-          - Tool 4: `inspect_page_visual(page_num, question, doc_id?)`
-          - Web Tools: `scrape_website(url)`, `web_search(query)`
-        """
-        if tool_name == "search_document":
-            q = str(arguments.get("query", ""))
-            top_k = int(arguments.get("top_k", 3))
-            doc_id = self.memory.get_tenant_doc_id(user_id=user_id, session_id=session_id, requested_doc_id=arguments.get("doc_id"))
-            extra = {"doc_id": doc_id} if doc_id else None
-            where = self.memory.build_tenant_where(user_id=user_id, session_id=session_id, extra=extra)
-            hits = await self.memory.query("docs_rag", q, n_results=top_k, where=where, relax_threshold=True)
-            return "\n\n".join(h["document"][:900] for h in hits) or "No matching sections found in your document."
-        if tool_name == "read_document_pages":
-            return self.memory.read_document_pages(
-                doc_id=arguments.get("doc_id"),
-                start_page=int(arguments.get("start_page", 1)),
-                end_page=int(arguments.get("end_page", 2)),
-                user_id=user_id,
-                session_id=session_id,
-            )
-        if tool_name == "query_table_data":
-            return self.memory.query_table_data(
-                doc_id=arguments.get("doc_id"),
-                sheet_or_table=str(arguments.get("sheet_or_table", "")),
-                filter_query=str(arguments.get("filter") or arguments.get("query") or ""),
-                user_id=user_id,
-                session_id=session_id,
-            )
-        if tool_name == "inspect_page_visual":
-            doc_id = self.memory.get_tenant_doc_id(user_id=user_id, session_id=session_id, requested_doc_id=arguments.get("doc_id"))
-            page_num = int(arguments.get("page_num", 1))
-            question = str(arguments.get("question", "Describe the chart, diagram, or text on this page."))
-            raw_pdf = self.memory._active_raw_bytes.get(doc_id or "")
-            if not raw_pdf:
-                return "No raw PDF bytes available in RAM for your user/session."
-            jpg_bytes = await asyncio.to_thread(UniversalDocumentParser._render_pdf_page_to_jpeg_ram, raw_pdf, page_num)
-            if not jpg_bytes:
-                return f"Could not render page {page_num} to image in RAM."
-            v_rep = await self.vision_tool.describe_and_index(
-                image_bytes=jpg_bytes,
-                user_hint=question,
-                user_id=user_id,
-                session_id=session_id,
-            )
-            return (
-                f"[Page {page_num} Visual Inspection]\n"
-                f"Summary: {v_rep.summary}\n"
-                f"Details: {v_rep.subjects_and_details}\n"
-                f"Visible Text (OCR): {v_rep.visible_text}"
-            )
-        if tool_name == "scrape_website":
-            url = str(arguments.get("url", ""))
-            hits = await self.web_tool.scrape_urls_and_ingest([url])
-            return "\n\n".join(h["document"] for h in hits) or f"Could not scrape {url}."
-        if tool_name == "web_search":
-            q = str(arguments.get("query", ""))
-            hits = await self.web_tool.search_and_ingest(q)
-            return "\n\n".join(h["document"] for h in hits) or f"No web results found for {q}."
-        return f"Unknown internal tool '{tool_name}'."
+        """Backwards-compatible string-returning wrapper around `execute_internal_tool_with_citations`."""
+        obs, _ = await self.execute_internal_tool_with_citations(
+            tool_name=tool_name,
+            arguments=arguments,
+            user_id=user_id,
+            session_id=session_id,
+            start_citation_idx=1,
+        )
+        return obs
 
     async def prepare_context(
         self,
@@ -3684,6 +3908,7 @@ class ChatOrchestrator:
         user_id: str = "default_user",
         session_id: str = "default_session",
         model_name: Optional[str] = None,
+        agentic_mode: bool = False,
     ) -> OrchestrationContext:
         metrics: Dict[str, float] = {}
         norm_msgs, embedded_img = extract_text_and_images(messages)
@@ -3760,28 +3985,38 @@ class ChatOrchestrator:
             )
             metrics["doc_parse_ms"] = round((time.perf_counter() - t_doc) * 1000, 2)
 
-        # 3. Execute Web Search / Direct URL Scraping / Strict Tenant-Isolated RAG Retrieval in parallel
+        # 3. Hybrid Dispatch:
+        #    - Fast Mode (`agentic_mode=False`): Pre-fetch Web / URL / RAG in parallel for 1-pass speed.
+        #    - Agentic Mode (`agentic_mode=True`): Do NOT pre-dump Web/RAG blindly; let the LLM autonomously
+        #      choose & chain `search_document`, `read_document_pages`, `query_table_data`, `get_weather`,
+        #      `web_search`, or `scrape_website` across multi-step ReAct iterations!
         t_tools = time.perf_counter()
         tasks: Dict[str, Any] = {}
-        if route.direct_urls:
-            tasks["web"] = self.web_tool.scrape_urls_and_ingest(route.direct_urls)
-        elif route.use_web:
-            tasks["web"] = self.web_tool.search_and_ingest(route.search_query)
+        if agentic_mode:
+            route.reason = "hybrid_agentic_react"
+            if route.use_image_search:
+                img_where = self.memory.build_tenant_where(user_id=uid, session_id=sid)
+                tasks["images"] = self.memory.query("image_index", user_query, n_results=settings.ORCH_MAX_RAG_CHUNKS, where=img_where)
+        else:
+            if route.direct_urls:
+                tasks["web"] = self.web_tool.scrape_urls_and_ingest(route.direct_urls)
+            elif route.use_web:
+                tasks["web"] = self.web_tool.search_and_ingest(route.search_query)
 
-        if route.use_rag:
-            # Strict tenant isolation: ONLY query documents belonging to (uid, sid)
-            extra_doc = {"doc_id": document_report.doc_id} if document_report else None
-            tenant_where = self.memory.build_tenant_where(user_id=uid, session_id=sid, extra=extra_doc)
-            tasks["rag"] = self.memory.query(
-                "docs_rag",
-                user_query,
-                n_results=settings.ORCH_MAX_RAG_CHUNKS,
-                where=tenant_where,
-                relax_threshold=bool(document_report),
-            )
-        if route.use_image_search:
-            img_where = self.memory.build_tenant_where(user_id=uid, session_id=sid)
-            tasks["images"] = self.memory.query("image_index", user_query, n_results=settings.ORCH_MAX_RAG_CHUNKS, where=img_where)
+            if route.use_rag:
+                # Strict tenant isolation: ONLY query documents belonging to (uid, sid)
+                extra_doc = {"doc_id": document_report.doc_id} if document_report else None
+                tenant_where = self.memory.build_tenant_where(user_id=uid, session_id=sid, extra=extra_doc)
+                tasks["rag"] = self.memory.query(
+                    "docs_rag",
+                    user_query,
+                    n_results=settings.ORCH_MAX_RAG_CHUNKS,
+                    where=tenant_where,
+                    relax_threshold=bool(document_report),
+                )
+            if route.use_image_search:
+                img_where = self.memory.build_tenant_where(user_id=uid, session_id=sid)
+                tasks["images"] = self.memory.query("image_index", user_query, n_results=settings.ORCH_MAX_RAG_CHUNKS, where=img_where)
 
         # Always fetch the single BEST factual memory match for (uid, sid) from ChromaDB chat_history
         tasks["history"] = self.memory.get_session_memory(
@@ -3833,8 +4068,25 @@ class ChatOrchestrator:
                 )
 
         idx = 1
-        # 3-Mode Intelligent Document Context Assembly
-        if document_report:
+        # In Agentic Mode, expose only lightweight <session_document_inventory> metadata so the LLM decides which tool (`search_document`, `read_document_pages`, `query_table_data`) to call!
+        if agentic_mode:
+            active_doc_obj = document_report
+            if active_doc_obj is None:
+                existing_doc_id = self.memory.get_tenant_doc_id(user_id=uid, session_id=sid)
+                if existing_doc_id:
+                    active_doc_obj = self.memory._active_docs.get(existing_doc_id)
+            if active_doc_obj is not None:
+                blocks.append(
+                    "<session_document_inventory>\n"
+                    f"Active Document ID: {active_doc_obj.doc_id} | Filename: {active_doc_obj.filename} | "
+                    f"Type: {active_doc_obj.file_type} | Profile: {active_doc_obj.doc_profile} | "
+                    f"Pages: {active_doc_obj.total_pages} | Chars: {active_doc_obj.total_chars}\n"
+                    f"{active_doc_obj.toc_summary}\n"
+                    "(Use `search_document`, `read_document_pages`, or `query_table_data` tools to inspect contents as needed.)\n"
+                    "</session_document_inventory>"
+                )
+        # 3-Mode Intelligent Document Context Assembly (Fast Mode)
+        elif document_report:
             blocks.append(f"<document_map>\n{document_report.toc_summary}\n</document_map>")
             req_pages = self._extract_requested_pages(user_query, document_report.total_pages)
             is_table_query = bool(
@@ -3975,8 +4227,14 @@ class ChatOrchestrator:
                 and not re.fullmatch(r"\s*remember\b.*", user_query, flags=re.IGNORECASE)
             )
         )
-        missing_local_docs = bool(explicit_local_doc_query and not document_report and not results.get("rag"))
-        if missing_local_docs:
+        has_any_tenant_doc = bool(document_report or self.memory.get_tenant_doc_id(user_id=uid, session_id=sid))
+        missing_local_docs = bool(
+            explicit_local_doc_query
+            and not document_report
+            and not results.get("rag")
+            and not (agentic_mode and has_any_tenant_doc)
+        )
+        if missing_local_docs and not agentic_mode:
             blocks.append(
                 "<local_documents_status>\n"
                 f"0 local or uploaded documents were found in ChromaDB (`docs_rag`) for user_id='{uid}' and session_id='{sid}', "
@@ -3984,13 +4242,22 @@ class ChatOrchestrator:
                 "</local_documents_status>"
             )
 
-        missing_live_web = bool(route.use_web and not results.get("web") and not vision_report and not document_report)
+        missing_live_web = bool((not agentic_mode) and route.use_web and not results.get("web") and not vision_report and not document_report)
 
         core_directives: List[str] = [
             "Use <conversation_memory> to recall facts and preferences the user told you previously in this session.",
             "Answer directly, truthfully, and thoroughly using the facts, tables, pages, memory, and exact URLs provided in <context>.",
         ]
-        if citations:
+        if agentic_mode:
+            core_directives.append(
+                "[AGENTIC REACT ORCHESTRATOR MODE]:\n"
+                "You are operating as an autonomous multi-step AI agent. "
+                "If answering accurately requires live web facts, live weather, scraping a URL, searching local documents (`docs_rag`), reading specific pages, or computing CSV/table aggregations, "
+                'call the appropriate tool first by outputting ONLY the JSON tool call `{"name": "...", "arguments": {...}}`. '
+                "After receiving `<tool_output>`, inspect whether you need another follow-up tool call (multi-hop) or have sufficient verified facts to write the final answer. "
+                "Cite numbered sources `[1]`, `[2]` ONLY when `<tool_output>` or `<context>` provides numbered `[1]` sources; never fabricate citations or document contents."
+            )
+        elif citations:
             core_directives.append(
                 "Cite numbered sources inline as [1], [2] ONLY when referencing the numbered sources provided inside <context>."
             )

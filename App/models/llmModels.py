@@ -25,6 +25,16 @@ class ChatRequest(BaseModel):
     response_format: Optional[Dict[str, Any]] = None
     # Orchestrator controls (optional, backwards-compatible, RAM-only image_base64)
     use_orchestrator: bool = True
+    agentic_mode: bool = Field(
+        default=False,
+        description="False = Fast 1-pass pre-fetch orchestrator; True = Autonomous multi-step ReAct agent where LLM chooses and chains DB/Web/Weather tools",
+    )
+    max_agent_steps: int = Field(
+        default=3,
+        ge=1,
+        le=6,
+        description="Maximum autonomous tool-calling hops when agentic_mode=True",
+    )
     use_web: Optional[bool] = None
     use_rag: Optional[bool] = None
     image_base64: Optional[str] = None
@@ -73,8 +83,12 @@ class ChatRequest(BaseModel):
                 "repeat_penalty": 1.1,
                 "stream": False,
                 "use_orchestrator": True,
+                "agentic_mode": False,
+                "max_agent_steps": 3,
                 "use_web": True,
                 "use_rag": False,
+                "tools": None,
+                "tool_choice": None,
             }
         }
     )
@@ -93,3 +107,6 @@ class ChatResponse(BaseModel):
     session_id: Optional[str] = None
     choices: List[ChatChoice]
     usage: dict = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    agentic_mode: bool = False
+    agent_trace: Optional[List[Dict[str, Any]]] = None
+    citations: Optional[List[Dict[str, Any]]] = None

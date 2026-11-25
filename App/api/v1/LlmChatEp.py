@@ -1,3 +1,4 @@
+from typing import Any
 from App.services.llm_service import LlmService, get_llm_service, llm_service
 from App.repository.llmRepository import llmChatRepo
 from App.core.orchestrator import ChatOrchestrator, detect_upload_kind
@@ -297,6 +298,341 @@ def _require_loaded_vision_model(orch: ChatOrchestrator) -> None:
         )
 
 
+def _merge_agentic_and_client_tools(
+    orch: ChatOrchestrator,
+    client_tools: list[dict] | None,
+    allow_web: bool = True,
+    allow_rag: bool = True,
+) -> list[dict]:
+    """Combine built-in orchestrator agentic tools with any external client-supplied OpenAI tools without duplicates."""
+    vision_ok = orch.vision_tool.is_loaded() or bool((settings.VISION_API_URL or "").strip())
+    internal = orch.get_agentic_tools(
+        has_local_docs=allow_rag,
+        allow_web=allow_web,
+        allow_vision=vision_ok,
+    )
+    if not client_tools:
+        return internal
+    existing_names = {
+        (t.get("function") or {}).get("name") or t.get("name")
+        for t in client_tools
+        if isinstance(t, dict)
+    }
+    merged = list(client_tools)
+    for it in internal:
+        if it["function"]["name"] not in existing_names:
+            merged.append(it)
+    return merged
+
+
+def _map_compact_react_arg(tool_name: str, raw_arg: str) -> dict[str, Any]:
+    """Convert compact GBNF ReAct `query_or_arg` string into structured tool arguments."""
+    import re as _re
+    arg = (raw_arg or "").strip()
+    if tool_name == "search_document":
+        return {"query": arg or "overview", "top_k": 3}
+    if tool_name == "search_images":
+        return {"query": arg or "image"}
+    if tool_name == "get_weather":
+        clean_city = _re.sub(r"^(?:weather\s+(?:in|for|at)\s+|live\s+weather\s+(?:in|for)\s+)", "", arg, flags=_re.IGNORECASE).strip(" ?!.,")
+        return {"location": clean_city or arg}
+    if tool_name == "web_search":
+        return {"query": arg}
+    if tool_name == "scrape_website":
+        return {"url": arg}
+    if tool_name == "query_table_data":
+        return {"filter": arg}
+    if tool_name == "read_document_pages":
+        nums = [int(x) for x in _re.findall(r"\d+", arg)]
+        if len(nums) >= 2:
+            return {"start_page": nums[0], "end_page": nums[1]}
+        if len(nums) == 1:
+            return {"start_page": nums[0], "end_page": nums[0]}
+        return {"start_page": 1, "end_page": 2}
+    if tool_name == "inspect_page_visual":
+        m = _re.match(r"^\s*(\d+)\s*[:\-,\s]\s*(.*)$", arg)
+        if m:
+            return {"page_num": int(m.group(1)), "question": m.group(2).strip() or "Describe this page."}
+        return {"page_num": 1, "question": arg or "Describe this page."}
+    return {"query": arg}
+
+
+async def _execute_hybrid_react_loop(
+    *,
+    service: LlmService,
+    orch: ChatOrchestrator,
+    orch_ctx: Any,
+    base_messages: list[dict],
+    active_tools: list[dict] | None,
+    tool_choice: Any,
+    gen_kwargs: dict[str, Any],
+    user_id: str,
+    session_id: str,
+    max_steps: int = 3,
+    is_agentic: bool = False,
+    client_tools: list[dict] | None = None,
+    prepare_for_final_stream: bool = False,
+) -> dict[str, Any]:
+    """
+    Hybrid Tool & Multi-Step Autonomous ReAct Engine:
+      1. When `is_agentic=True` (and no custom external client tools override):
+         Uses a C++ GBNF Grammar-Constrained ReAct Planner (`LlamaGrammar.from_json_schema`)
+         with a compact ~90-token tool menu so even quantized 7B/16B GGUF models (`Q4_K_M`)
+         NEVER stall in chatty prose ("Let's start with step 1") and execute each reasoning hop
+         in ~2 seconds!
+      2. When external `client_tools` are provided:
+         Supports arbitrary OpenAI `tools` JSON schemas and returns `finish_reason="tool_calls"`.
+    """
+    from App.core.orchestrator import IntentRouter
+
+    total_usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    agent_trace: list[dict[str, Any]] = []
+    seen_calls: set[str] = set()
+    steps_limit = max(1, min(int(max_steps or 3), 6))
+
+    has_external_client_tools = bool(
+        client_tools
+        and any(
+            ((t.get("function") or {}).get("name") or t.get("name")) not in orch.INTERNAL_TOOL_NAMES
+            for t in client_tools
+            if isinstance(t, dict)
+        )
+    )
+
+    # =========================================================================
+    # PATH A: External OpenAI Function-Calling Tools (e.g., convert_currency)
+    # =========================================================================
+    if has_external_client_tools or not is_agentic:
+        working_msgs = [dict(m) for m in base_messages]
+        msgs_with_tools = _inject_tools_into_messages(working_msgs, active_tools, tool_choice)
+        step_prompt = await service.format_messages_native(msgs_with_tools, tools=active_tools)
+        async with orch.vram_gate:
+            ai_msg = await service.chat_with_metadata(prompt=step_prompt, **gen_kwargs)
+        step_content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
+        meta = getattr(ai_msg, "response_metadata", {}) or {}
+        u = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+        total_usage = dict(u)
+
+        parsed_calls = _extract_tool_calls(step_content, active_tools)
+        if not parsed_calls:
+            return {
+                "stream_messages": None,
+                "content": step_content,
+                "tool_calls": None,
+                "finish_reason": meta.get("finish_reason", "stop"),
+                "usage": total_usage,
+                "agent_trace": agent_trace,
+            }
+        t_name = parsed_calls[0]["function"]["name"]
+        if t_name not in orch.INTERNAL_TOOL_NAMES:
+            return {
+                "stream_messages": None,
+                "content": "",
+                "tool_calls": parsed_calls,
+                "finish_reason": "tool_calls",
+                "usage": total_usage,
+                "agent_trace": agent_trace,
+            }
+
+    # =========================================================================
+    # PATH B: True Multi-Step GBNF Grammar-Constrained ReAct Agent (`is_agentic=True`)
+    # =========================================================================
+    internal_tool_names = [
+        (t.get("function") or {}).get("name")
+        for t in (active_tools or [])
+        if isinstance(t, dict) and (t.get("function") or {}).get("name") in orch.INTERNAL_TOOL_NAMES
+    ]
+    if not internal_tool_names:
+        internal_tool_names = ["search_document", "read_document_pages", "query_table_data", "web_search", "get_weather", "scrape_website"]
+
+    tool_catalog_lines = [
+        "- search_document: Search user's uploaded/local session documents in ChromaDB (`query_or_arg` = search keywords)",
+        "- read_document_pages: Read exact page numbers from uploaded document (`query_or_arg` = e.g. '1' or '2-4')",
+        "- query_table_data: Compute exact sum/average/filter on CSV or table columns (`query_or_arg` = column or filter)",
+        "- get_weather: Get real-time live weather for a city (`query_or_arg` = city name ONLY, e.g. 'London')",
+        "- web_search: Search live internet & news for recent facts/winners (`query_or_arg` = search query)",
+        "- scrape_website: Scrape text from a specific URL (`query_or_arg` = full https:// URL)",
+        "- search_images: Search previously uploaded/described images & OCR in this session (`query_or_arg` = visual/OCR keywords)",
+    ]
+    if "inspect_page_visual" in internal_tool_names:
+        tool_catalog_lines.append("- inspect_page_visual: OCR/vision analysis on a PDF page (`query_or_arg` = '1: question')")
+
+    user_q = orch_ctx.user_query if orch_ctx is not None else next((m.get("content", "") for m in reversed(base_messages) if m.get("role") == "user"), "")
+    explicit_external_need = bool(
+        tool_choice == "required"
+        or IntentRouter.RAG_PATTERNS.search(user_q)
+        or IntentRouter.WEB_PATTERNS.search(user_q)
+        or (orch_ctx is not None and (orch_ctx.route.use_web or orch_ctx.document_report is not None))
+    )
+
+    observations_log: list[str] = []
+
+    for step_idx in range(1, steps_limit + 1):
+        # On Step 1, if user explicitly asked about docs/weather/web/URL, force action='call_tool' so small models never procrastinate
+        if step_idx == 1 and explicit_external_need:
+            action_enum = ["call_tool"]
+            tool_enum = list(internal_tool_names)
+        else:
+            action_enum = ["call_tool", "final_answer"]
+            tool_enum = ["none"] + list(internal_tool_names)
+
+        react_schema = {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": action_enum},
+                "tool_name": {"type": "string", "enum": tool_enum},
+                "query_or_arg": {"type": "string", "minLength": 1},
+            },
+            "required": ["action", "tool_name", "query_or_arg"],
+            "additionalProperties": False,
+        }
+
+        obs_section = (
+            "\n\n[Completed Tool Observations So Far]:\n" + "\n\n".join(observations_log)
+            if observations_log
+            else "\n\n[Completed Tool Observations So Far]: None yet."
+        )
+        planner_msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "You are an autonomous ReAct Tool Planner. Decide the single next step as JSON.\n"
+                    "Available Tools:\n" + "\n".join(tool_catalog_lines) + "\n\n"
+                    "Rules:\n"
+                    "1. MULTI-HOP DEPENDENCY ORDER: If the user asks to find an unknown fact/city/value in their document FIRST and then use another tool (like get_weather or web_search) on that result, you MUST call `search_document` (or `read_document_pages`) on Step 1 FIRST! NEVER guess a city or value before looking it up.\n"
+                    "2. If you still need information from a document, table, live weather, or web to answer EVERY part of the user's request, set action='call_tool', pick the exact tool_name, and put ONLY the clean search/city/page argument in query_or_arg.\n"
+                    "3. Never repeat a tool call that already succeeded in [Completed Tool Observations So Far].\n"
+                    "4. Once ALL parts of the user's request are answered by [Completed Tool Observations So Far] (or if no tool is needed), set action='final_answer', tool_name='none', query_or_arg='done'."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"User Request: {user_q}{obs_section}\n\nOutput the next ReAct JSON decision:",
+            },
+        ]
+
+        planner_prompt = await service.format_messages_native(planner_msgs, tools=None)
+        planner_kwargs = {
+            "temperature": 0.1,
+            "max_tokens": 96,
+            "response_format": {"type": "json_schema", "json_schema": {"name": "react_step", "schema": react_schema}},
+        }
+        async with orch.vram_gate:
+            plan_msg = await service.chat_with_metadata(prompt=planner_prompt, **planner_kwargs)
+
+        plan_raw = plan_msg.content if hasattr(plan_msg, "content") else str(plan_msg)
+        meta_p = getattr(plan_msg, "response_metadata", {}) or {}
+        u_p = meta_p.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+        total_usage["prompt_tokens"] += u_p.get("prompt_tokens", 0)
+        total_usage["completion_tokens"] += u_p.get("completion_tokens", 0)
+        total_usage["total_tokens"] += u_p.get("total_tokens", 0)
+
+        try:
+            decision = json.loads(plan_raw.strip())
+        except Exception:
+            logger.warning(f"Planner JSON parse fallback on raw={plan_raw!r}")
+            break
+
+        action = decision.get("action")
+        t_name = decision.get("tool_name")
+        raw_arg = str(decision.get("query_or_arg", "")).strip()
+
+        if action == "final_answer" or not t_name or t_name == "none" or t_name not in orch.INTERNAL_TOOL_NAMES:
+            logger.info(f"✅ [Agent Step {step_idx}] Planner selected final_answer")
+            break
+
+        t_args = _map_compact_react_arg(t_name, raw_arg)
+        sig_key = f"{t_name}:{json.dumps(t_args, sort_keys=True)}"
+        if sig_key in seen_calls:
+            logger.info(f"🔁 [Agent Step {step_idx}] Duplicate call {sig_key} prevented; moving to final synthesis")
+            break
+        seen_calls.add(sig_key)
+
+        t_step0 = time.perf_counter()
+        next_cit_idx = (len(orch_ctx.citations) + 1) if orch_ctx is not None else 1
+        tool_obs, new_cits = await orch.execute_internal_tool_with_citations(
+            tool_name=t_name,
+            arguments=t_args,
+            user_id=user_id,
+            session_id=session_id,
+            start_citation_idx=next_cit_idx,
+        )
+        step_ms = round((time.perf_counter() - t_step0) * 1000, 2)
+        if orch_ctx is not None and new_cits:
+            orch_ctx.citations.extend(new_cits)
+
+        logger.info(f"🤖 [Agent Step {step_idx}/{steps_limit}] {t_name}({t_args}) -> {len(tool_obs)} chars in {step_ms}ms")
+        agent_trace.append({
+            "step": step_idx,
+            "tool": t_name,
+            "arguments": t_args,
+            "duration_ms": step_ms,
+            "citations_added": len(new_cits),
+            "observation_preview": tool_obs[:240],
+        })
+        observations_log.append(f"<tool_output step='{step_idx}' tool='{t_name}' args='{json.dumps(t_args)}'>\n{tool_obs}\n</tool_output>")
+
+    # Assemble clean synthesis messages with all gathered <tool_output> blocks
+    synthesis_messages = [dict(m) for m in base_messages]
+    if observations_log:
+        obs_bundle = "<agent_tool_observations>\n" + "\n\n".join(observations_log) + "\n</agent_tool_observations>"
+        for i in range(len(synthesis_messages) - 1, -1, -1):
+            if synthesis_messages[i].get("role") == "user":
+                synthesis_messages[i] = {
+                    "role": "user",
+                    "content": (
+                        f"{obs_bundle}\n\n"
+                        f"User Question: {synthesis_messages[i]['content']}\n"
+                        "(Answer directly and completely using the verified <agent_tool_observations> above. Cite numbered sources [1], [2] inline where used.)"
+                    ),
+                }
+                break
+
+    if prepare_for_final_stream:
+        return {
+            "stream_messages": synthesis_messages,
+            "content": "",
+            "tool_calls": None,
+            "finish_reason": "stop",
+            "usage": total_usage,
+            "agent_trace": agent_trace,
+        }
+
+    synth_prompt = await service.format_messages_native(synthesis_messages, tools=None)
+    async with orch.vram_gate:
+        ai_final = await service.chat_with_metadata(prompt=synth_prompt, **gen_kwargs)
+    final_content = ai_final.content if hasattr(ai_final, "content") else str(ai_final)
+    meta_f = getattr(ai_final, "response_metadata", {}) or {}
+    u_f = meta_f.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    total_usage["prompt_tokens"] += u_f.get("prompt_tokens", 0)
+    total_usage["completion_tokens"] += u_f.get("completion_tokens", 0)
+    total_usage["total_tokens"] += u_f.get("total_tokens", 0)
+
+    return {
+        "stream_messages": None,
+        "content": final_content,
+        "tool_calls": None,
+        "finish_reason": meta_f.get("finish_reason", "stop"),
+        "usage": total_usage,
+        "agent_trace": agent_trace,
+    }
+
+
+def _parse_optional_tools_json(tools_raw: str | None) -> list[dict] | None:
+    """Safely parse an optional JSON string array/object of OpenAI tool schemas from multipart Form fields."""
+    if not tools_raw or not tools_raw.strip() or tools_raw.strip() in ("string", "null", "None"):
+        return None
+    try:
+        loaded = json.loads(tools_raw)
+        if isinstance(loaded, dict):
+            loaded = [loaded]
+        if isinstance(loaded, list) and loaded != [{"additionalProp1": {}}]:
+            return loaded
+    except Exception:
+        return None
+    return None
+
+
 @llmRouter.post("/chat/completions")
 async def completion(
     req: Request,
@@ -304,6 +640,22 @@ async def completion(
     image: UploadFile | None = File(
         default=None,
         description="Optional file or image upload (auto-detects Images, PDF, Scanned PDF, DOCX, XLSX, CSV, ZIP, JSON, TXT, Code strictly in RAM)",
+    ),
+    agentic_mode: bool | None = Form(
+        default=None,
+        description="Optional Form override: True enables autonomous multi-step ReAct Agentic tool loop",
+    ),
+    max_agent_steps: int | None = Form(
+        default=None,
+        description="Optional Form override: Max ReAct agent hops (1..6) when agentic_mode=True",
+    ),
+    tools: str | None = Form(
+        default=None,
+        description="Optional Form override: JSON array of OpenAI tool definitions",
+    ),
+    tool_choice: str | None = Form(
+        default=None,
+        description="Optional Form override: tool_choice ('auto', 'none', 'required')",
     ),
     service: LlmService = Depends(get_repo),
 ):
@@ -318,6 +670,15 @@ async def completion(
     else:
         if request is None:
             raise MissingRequestFieldError("Missing 'request' JSON form field")
+        if agentic_mode is not None:
+            request.agentic_mode = agentic_mode
+        if max_agent_steps is not None:
+            request.max_agent_steps = max(1, min(int(max_agent_steps), 6))
+        form_tools = _parse_optional_tools_json(tools)
+        if form_tools is not None:
+            request.tools = form_tools
+        if tool_choice and tool_choice.strip() not in ("", "string", "null", "None"):
+            request.tool_choice = tool_choice.strip()
         if image is not None and image.filename:
             uploaded_bytes = await image.read()
             uploaded_filename = image.filename
@@ -354,16 +715,19 @@ async def completion(
     # ============================================
     # 1. ORCHESTRATION (RAG + WEB SEARCH + DIRECT URL SCRAPE + VISION + UNIVERSAL DOC PARSER)
     # ============================================
+    is_agentic = bool(getattr(request, "agentic_mode", False))
+    max_agent_steps = int(getattr(request, "max_agent_steps", 3) or 3)
     orch_ctx = None
     should_orchestrate = settings.ORCH_ENABLED and (
-        getattr(request, "use_orchestrator", True)
+        is_agentic
+        or getattr(request, "use_orchestrator", True)
         or getattr(request, "use_web", None) is True
         or getattr(request, "use_rag", None) is True
         or uploaded_bytes is not None
         or getattr(request, "image_base64", None) is not None
     )
     effective_force_web = getattr(request, "use_web", None)
-    if effective_force_web is None and request.tools and request.tool_choice != "none":
+    if effective_force_web is None and request.tools and request.tool_choice != "none" and not is_agentic:
         # Do not pre-empt explicit external function-calling tools with background web scraping unless use_web=True
         effective_force_web = False
 
@@ -378,6 +742,7 @@ async def completion(
             user_id=tenant_user_id,
             session_id=tenant_session_id,
             model_name=active_model,
+            agentic_mode=is_agentic,
         )
         raw_messages = orch_ctx.enriched_messages
         logger.info(
@@ -408,8 +773,22 @@ async def completion(
     if not raw_messages:
         raw_messages = [{"role": "user", "content": "Hello"}]
 
-    raw_messages = _inject_tools_into_messages(raw_messages, request.tools, request.tool_choice)
-    prompt = await service.format_messages_native(raw_messages, tools=request.tools)
+    active_tools = (
+        _merge_agentic_and_client_tools(
+            _orchestrator,
+            request.tools,
+            allow_web=(getattr(request, "use_web", None) is not False),
+            allow_rag=(getattr(request, "use_rag", None) is not False),
+        )
+        if is_agentic
+        else request.tools
+    )
+    base_messages_for_agent = [dict(m) for m in raw_messages]
+    if not is_agentic:
+        raw_messages = _inject_tools_into_messages(raw_messages, active_tools, request.tool_choice)
+        prompt = await service.format_messages_native(raw_messages, tools=active_tools)
+    else:
+        prompt = ""
 
     logger.info(f"📝 Prompt: {len(prompt)} chars")
     logger.info(f"📄 Preview: {prompt[:150]}...")
@@ -435,6 +814,24 @@ async def completion(
 
     use_stream = request.stream if request.stream is not None else settings.STREAM_RESPONSE
     if use_stream:
+        if is_agentic and active_tools:
+            loop_pre = await _execute_hybrid_react_loop(
+                service=service,
+                orch=_orchestrator,
+                orch_ctx=orch_ctx,
+                base_messages=base_messages_for_agent,
+                active_tools=active_tools,
+                tool_choice=request.tool_choice,
+                gen_kwargs=gen_kwargs,
+                user_id=tenant_user_id,
+                session_id=tenant_session_id,
+                max_steps=max_agent_steps,
+                is_agentic=is_agentic,
+                client_tools=request.tools,
+                prepare_for_final_stream=True,
+            )
+            if loop_pre["stream_messages"] is not None:
+                prompt = await service.format_messages_native(loop_pre["stream_messages"])
         response_id = f"chatcmpl-{uuid4().hex[:8]}"
         stream_task_id = f"strm-{uuid4().hex[:10]}"
         created = int(time.time())
@@ -502,60 +899,43 @@ async def completion(
             },
         )
 
-    async with _orchestrator.vram_gate:
-        ai_msg = await service.chat_with_metadata(
-            prompt=prompt,
-            **gen_kwargs
-        )
-
-    content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
-    meta = getattr(ai_msg, "response_metadata", {}) or {}
-    exact_usage = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
-    tool_calls = _extract_tool_calls(content, request.tools)
-
-    # If the LLM invoked one of the orchestrator's internal document/web tools, execute it and synthesize final answer
-    internal_tools = {
-        "search_document",
-        "read_document_pages",
-        "query_table_data",
-        "inspect_page_visual",
-        "scrape_website",
-        "web_search",
-    }
-    if tool_calls and tool_calls[0]["function"]["name"] in internal_tools:
-        t_call = tool_calls[0]["function"]
-        t_name = t_call["name"]
-        try:
-            t_args = json.loads(t_call["arguments"]) if isinstance(t_call["arguments"], str) else t_call["arguments"]
-        except Exception:
-            t_args = {}
-        logger.info(f"🔧 Executing internal orchestrator tool: {t_name}({t_args}) for user={tenant_user_id}")
-        tool_output = await _orchestrator.execute_internal_tool(
-            t_name,
-            t_args,
+    agent_trace: list[dict[str, Any]] | None = None
+    if is_agentic or active_tools:
+        t_ag0 = time.perf_counter()
+        loop_res = await _execute_hybrid_react_loop(
+            service=service,
+            orch=_orchestrator,
+            orch_ctx=orch_ctx,
+            base_messages=base_messages_for_agent,
+            active_tools=active_tools,
+            tool_choice=request.tool_choice,
+            gen_kwargs=gen_kwargs,
             user_id=tenant_user_id,
             session_id=tenant_session_id,
+            max_steps=max_agent_steps if is_agentic else 1,
+            is_agentic=is_agentic,
+            client_tools=request.tools,
         )
-        followup_msgs = list(raw_messages) + [
-            {"role": "assistant", "content": content},
-            {"role": "user", "content": f"<tool_output name='{t_name}'>\n{tool_output}\n</tool_output>\nNow answer the user's question directly using this tool output."},
-        ]
-        followup_prompt = await service.format_messages_native(followup_msgs)
+        content = loop_res["content"]
+        tool_calls = loop_res["tool_calls"]
+        finish_reason = loop_res["finish_reason"]
+        exact_usage = loop_res["usage"]
+        agent_trace = loop_res["agent_trace"] if is_agentic else (loop_res["agent_trace"] or None)
+        if orch_ctx is not None and is_agentic:
+            orch_ctx.metrics_ms["agent_loop_ms"] = round((time.perf_counter() - t_ag0) * 1000, 2)
+    else:
         async with _orchestrator.vram_gate:
-            ai_msg2 = await service.chat_with_metadata(prompt=followup_prompt, **gen_kwargs)
-        content = ai_msg2.content if hasattr(ai_msg2, "content") else str(ai_msg2)
-        meta2 = getattr(ai_msg2, "response_metadata", {}) or {}
-        u2 = meta2.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
-        exact_usage = {
-            "prompt_tokens": exact_usage.get("prompt_tokens", 0) + u2.get("prompt_tokens", 0),
-            "completion_tokens": exact_usage.get("completion_tokens", 0) + u2.get("completion_tokens", 0),
-            "total_tokens": exact_usage.get("total_tokens", 0) + u2.get("total_tokens", 0),
-        }
+            ai_msg = await service.chat_with_metadata(
+                prompt=prompt,
+                **gen_kwargs
+            )
+        content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
+        meta = getattr(ai_msg, "response_metadata", {}) or {}
+        exact_usage = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
         tool_calls = None
+        finish_reason = meta.get("finish_reason", "stop")
 
-    finish_reason = "tool_calls" if tool_calls else meta.get("finish_reason", "stop")
-
-    if orch_ctx is not None:
+    if orch_ctx is not None and content:
         await _orchestrator.memory.record_chat_turn(
             query=orch_ctx.user_query,
             answer=content,
@@ -565,7 +945,7 @@ async def completion(
             session_id=tenant_session_id,
         )
 
-    logger.info(f"✅ LLM response received: {content[:100]}...")
+    logger.info(f"✅ LLM response received (agentic={is_agentic}, steps={len(agent_trace or [])}): {(content or '')[:100]}...")
 
     return ChatResponse(
         id=f"chatcmpl-{uuid4().hex[:8]}",
@@ -586,6 +966,9 @@ async def completion(
             )
         ],
         usage=exact_usage,
+        agentic_mode=is_agentic,
+        agent_trace=agent_trace,
+        citations=[c.model_dump() for c in orch_ctx.citations] if (orch_ctx and orch_ctx.citations) else None,
     )
 
 
@@ -969,12 +1352,27 @@ MAX_IMAGE_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB RAM guard
 async def describe_uploaded_image(
     req: Request,
     image: UploadFile = File(..., description="Image file processed strictly in RAM"),
-    prompt: str = Form(default="", description="Optional question or focus hint for Vision model"),
+    prompt: str = Form(default="", description="Optional question, focus hint, or multi-step agent instruction for the image"),
     user_id: str | None = Form(default=None),
     session_id: str | None = Form(default=None),
+    agentic_mode: bool = Form(
+        default=False,
+        description="False = Pure Vision OCR/describe only; True = Run Vision OCR/describe AND chain autonomous ReAct agent tools (Web/Weather/RAG/Custom Tools) using the loaded LLM",
+    ),
+    max_agent_steps: int = Form(default=3, description="Max ReAct agent hops when agentic_mode=True (1..6)"),
+    model: str | None = Form(default=None, description="Optional loaded LLM name when agentic_mode=True or tools are provided"),
+    tools: str | None = Form(default=None, description="Optional JSON array of OpenAI tool definitions"),
+    tool_choice: str | None = Form(default=None, description="Optional tool_choice ('auto', 'none', 'required')"),
+    temperature: float | None = Form(default=0.2),
+    max_tokens: int | None = Form(default=512),
+    service: LlmService = Depends(get_repo),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
-    """Upload an image -> decode in RAM with resident Vision model -> index in ChromaDB isolated by (user_id, session_id)."""
+    """
+    Upload an image -> decode in RAM with Vision model (local or VISION_API_URL) -> index in ChromaDB isolated by (user_id, session_id).
+    - Default (`agentic_mode=False` and no `tools`): Returns pure `vision_report` (works on Vision-only cluster nodes without needing an LLM loaded).
+    - Agentic / Tool Mode (`agentic_mode=True` or `tools` provided): Feeds `<vision_analysis>` + OCR into the Hybrid ReAct Agent so it can autonomously chain Web Search, Live Weather, Local Docs RAG, or Custom Tools!
+    """
     _require_loaded_vision_model(orch)
     uid, sid = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
     image_bytes = await image.read()
@@ -983,13 +1381,94 @@ async def describe_uploaded_image(
     if len(image_bytes) > MAX_IMAGE_UPLOAD_BYTES:
         raise ImageTooLargeError("Image exceeds 15MB limit")
 
+    t_vis0 = time.perf_counter()
     report = await orch.vision_tool.describe_and_index(
         image_bytes=image_bytes,
         user_hint=prompt,
         user_id=uid,
         session_id=sid,
     )
-    return {"status": "ok", "user_id": uid, "session_id": sid, "vision_report": report.model_dump()}
+    vision_ms = round((time.perf_counter() - t_vis0) * 1000, 2)
+
+    parsed_tools = _parse_optional_tools_json(tools)
+    clean_tool_choice = tool_choice.strip() if (tool_choice and tool_choice.strip() not in ("", "string", "null", "None")) else None
+
+    # Pure Vision mode (backwards-compatible for vision-only cluster nodes & standard /vision/describe callers)
+    if not agentic_mode and not parsed_tools:
+        return {
+            "status": "ok",
+            "user_id": uid,
+            "session_id": sid,
+            "vision_report": report.model_dump(),
+            "metrics_ms": {"vision_ms": vision_ms},
+        }
+
+    # Agentic / Tool-enabled Vision workflow (requires loaded text LLM)
+    clean_model = model.strip() if (model and model.strip() not in ("", "string", "null", "None")) else None
+    active_model = await _require_loaded_model(service, clean_model)
+    effective_question = prompt.strip() or f"Analyze this image ({report.summary}) and provide helpful insights."
+
+    vision_block = (
+        "<vision_analysis>\n"
+        f"Scene: {report.scene}\n"
+        f"Objects: {', '.join(report.objects)}\n"
+        f"Subjects & Details: {report.subjects_and_details}\n"
+        f"Colors & Lighting: {report.colors_and_lighting}\n"
+        f"Visible Text (OCR): {report.visible_text}\n"
+        f"Summary: {report.summary}\n"
+        f"Suggested Search Query: {report.search_query}\n"
+        "</vision_analysis>"
+    )
+    orch_ctx = await orch.prepare_context(
+        [{"role": "user", "content": f"{vision_block}\n\nUser Task: {effective_question}"}],
+        force_web=False,
+        force_rag=False,
+        user_id=uid,
+        session_id=sid,
+        model_name=active_model,
+        agentic_mode=agentic_mode,
+    )
+    orch_ctx.vision_report = report
+    orch_ctx.user_query = f"{effective_question} (Image Summary: {report.summary} | Visible Text: {report.visible_text[:200]})"
+
+    active_vis_tools = (
+        _merge_agentic_and_client_tools(orch, parsed_tools, allow_web=True, allow_rag=True)
+        if agentic_mode
+        else parsed_tools
+    )
+    gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
+    t_ag0 = time.perf_counter()
+    loop_res = await _execute_hybrid_react_loop(
+        service=service,
+        orch=orch,
+        orch_ctx=orch_ctx,
+        base_messages=orch_ctx.enriched_messages,
+        active_tools=active_vis_tools,
+        tool_choice=clean_tool_choice,
+        gen_kwargs=gen_kwargs,
+        user_id=uid,
+        session_id=sid,
+        max_steps=max_agent_steps if agentic_mode else 1,
+        is_agentic=agentic_mode,
+        client_tools=parsed_tools,
+    )
+    agent_ms = round((time.perf_counter() - t_ag0) * 1000, 2)
+
+    return {
+        "status": "ok",
+        "model": active_model,
+        "user_id": uid,
+        "session_id": sid,
+        "agentic_mode": agentic_mode,
+        "vision_report": report.model_dump(),
+        "agent_answer": None if loop_res["tool_calls"] else loop_res["content"],
+        "tool_calls": loop_res["tool_calls"],
+        "finish_reason": loop_res["finish_reason"],
+        "agent_trace": loop_res["agent_trace"],
+        "citations": [c.model_dump() for c in orch_ctx.citations],
+        "usage": loop_res["usage"],
+        "metrics_ms": {**orch_ctx.metrics_ms, "vision_ms": vision_ms, "agent_loop_ms": agent_ms},
+    }
 
 
 @llmRouter.post("/chat/completions/upload")
@@ -1007,6 +1486,11 @@ async def chat_with_uploaded_image(
     ),
     user_id: str | None = Form(default=None),
     session_id: str | None = Form(default=None),
+    agentic_mode: bool = Form(
+        default=False,
+        description="False = Fast 1-pass pre-fetch mode; True = Multi-step ReAct Agentic mode where LLM chooses & chains DB/Web/Weather tools",
+    ),
+    max_agent_steps: int = Form(default=3, description="Max autonomous tool-calling iterations when agentic_mode=True (1..6)"),
     use_web: bool | None = Form(default=None),
     use_rag: bool | None = Form(default=None),
     tools: str | None = Form(default=None, description="Optional JSON array of OpenAI tool definitions"),
@@ -1052,7 +1536,7 @@ async def chat_with_uploaded_image(
         except Exception:
             parsed_tools = None
     clean_tool_choice = tool_choice.strip() if (tool_choice and tool_choice.strip() not in ("", "string", "null", "None")) else None
-    effective_use_web = False if (use_web is None and parsed_tools and clean_tool_choice != "none") else use_web
+    effective_use_web = False if (use_web is None and parsed_tools and clean_tool_choice != "none" and not agentic_mode) else use_web
 
     orch_ctx = await orch.prepare_context(
         messages_chain,
@@ -1063,24 +1547,60 @@ async def chat_with_uploaded_image(
         user_id=uid,
         session_id=sid,
         model_name=active_model,
+        agentic_mode=agentic_mode,
     )
-    final_msgs = _inject_tools_into_messages(orch_ctx.enriched_messages, parsed_tools, clean_tool_choice)
-    formatted_prompt = await service.format_messages_native(final_msgs, tools=parsed_tools)
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
-    async with orch.vram_gate:
-        response = await service.chat(prompt=formatted_prompt, **gen_kwargs)
-    content = response if isinstance(response, str) else str(response)
-    extracted_calls = _extract_tool_calls(content, parsed_tools)
-    finish_reason = "tool_calls" if extracted_calls else "stop"
-
-    await orch.memory.record_chat_turn(
-        query=orch_ctx.user_query,
-        answer=content,
-        model_used=active_model,
-        route=orch_ctx.route,
-        user_id=uid,
-        session_id=sid,
+    active_upload_tools = (
+        _merge_agentic_and_client_tools(
+            orch,
+            parsed_tools,
+            allow_web=(use_web is not False),
+            allow_rag=(use_rag is not False),
+        )
+        if agentic_mode
+        else parsed_tools
     )
+
+    agent_trace: list[dict[str, Any]] | None = None
+    if agentic_mode or active_upload_tools:
+        t_ag0 = time.perf_counter()
+        loop_res = await _execute_hybrid_react_loop(
+            service=service,
+            orch=orch,
+            orch_ctx=orch_ctx,
+            base_messages=orch_ctx.enriched_messages,
+            active_tools=active_upload_tools,
+            tool_choice=clean_tool_choice,
+            gen_kwargs=gen_kwargs,
+            user_id=uid,
+            session_id=sid,
+            max_steps=max_agent_steps if agentic_mode else 1,
+            is_agentic=agentic_mode,
+            client_tools=parsed_tools,
+        )
+        content = loop_res["content"]
+        extracted_calls = loop_res["tool_calls"]
+        finish_reason = loop_res["finish_reason"]
+        agent_trace = loop_res["agent_trace"] if agentic_mode else (loop_res["agent_trace"] or None)
+        if agentic_mode:
+            orch_ctx.metrics_ms["agent_loop_ms"] = round((time.perf_counter() - t_ag0) * 1000, 2)
+    else:
+        formatted_prompt = await service.format_messages_native(orch_ctx.enriched_messages)
+        async with orch.vram_gate:
+            response = await service.chat(prompt=formatted_prompt, **gen_kwargs)
+        content = response if isinstance(response, str) else str(response)
+        extracted_calls = None
+        finish_reason = "stop"
+
+    if content:
+        await orch.memory.record_chat_turn(
+            query=orch_ctx.user_query,
+            answer=content,
+            model_used=active_model,
+            route=orch_ctx.route,
+            user_id=uid,
+            session_id=sid,
+        )
     msg_out: dict[str, Any] = {"role": "assistant", "content": None if extracted_calls else content}
     if extracted_calls:
         msg_out["tool_calls"] = extracted_calls
@@ -1092,6 +1612,8 @@ async def chat_with_uploaded_image(
         "user_id": uid,
         "session_id": sid,
         "system_prompts_count": len(sys_chain),
+        "agentic_mode": agentic_mode,
+        "agent_trace": agent_trace,
         "choices": [{"index": 0, "message": msg_out, "finish_reason": finish_reason}],
         "vision_report": orch_ctx.vision_report.model_dump() if orch_ctx.vision_report else None,
         "document_report": (
@@ -1119,6 +1641,13 @@ async def chat_with_uploaded_code(
     ),
     user_id: str | None = Form(default=None),
     session_id: str | None = Form(default=None),
+    agentic_mode: bool = Form(
+        default=False,
+        description="False = Fast AST analysis; True = Multi-step ReAct Agentic mode with AST/RAG/Web/Custom Tools",
+    ),
+    max_agent_steps: int = Form(default=3, description="Max ReAct agent hops when agentic_mode=True (1..6)"),
+    tools: str | None = Form(default=None, description="Optional JSON array of OpenAI tool definitions"),
+    tool_choice: str | None = Form(default=None, description="Optional tool_choice ('auto', 'none', 'required')"),
     use_web: bool | None = Form(default=False),
     use_rag: bool | None = Form(default=True),
     temperature: float | None = Form(default=0.2),
@@ -1237,6 +1766,9 @@ async def chat_with_uploaded_code(
     user_content = f"{code_context_block}\n\nCoding Task / Question: {prompt}".strip() if code_context_block else prompt
     messages_chain.append({"role": "user", "content": user_content})
 
+    parsed_code_tools = _parse_optional_tools_json(tools)
+    clean_code_choice = tool_choice.strip() if (tool_choice and tool_choice.strip() not in ("", "string", "null", "None")) else None
+
     # Also allow retrieving previously uploaded code AST chunks or session memory in the same (uid, sid)
     orch_ctx = await orch.prepare_context(
         messages_chain,
@@ -1245,15 +1777,46 @@ async def chat_with_uploaded_code(
         user_id=uid,
         session_id=sid,
         model_name=active_model,
+        agentic_mode=agentic_mode,
     )
-    formatted_prompt = await service.format_messages_native(orch_ctx.enriched_messages)
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
-    async with orch.vram_gate:
-        ai_msg = await service.chat_with_metadata(prompt=formatted_prompt, **gen_kwargs)
-
-    content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
-    meta = getattr(ai_msg, "response_metadata", {}) or {}
-    exact_usage = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+    active_code_tools = (
+        _merge_agentic_and_client_tools(orch, parsed_code_tools, allow_web=(use_web is not False or agentic_mode), allow_rag=(use_rag is not False))
+        if agentic_mode
+        else parsed_code_tools
+    )
+    code_agent_trace: list[dict[str, Any]] | None = None
+    code_tool_calls: list[dict] | None = None
+    if agentic_mode or active_code_tools:
+        t_ag0 = time.perf_counter()
+        loop_res = await _execute_hybrid_react_loop(
+            service=service,
+            orch=orch,
+            orch_ctx=orch_ctx,
+            base_messages=orch_ctx.enriched_messages,
+            active_tools=active_code_tools,
+            tool_choice=clean_code_choice,
+            gen_kwargs=gen_kwargs,
+            user_id=uid,
+            session_id=sid,
+            max_steps=max_agent_steps if agentic_mode else 1,
+            is_agentic=agentic_mode,
+            client_tools=parsed_code_tools,
+        )
+        content = loop_res["content"]
+        code_tool_calls = loop_res["tool_calls"]
+        meta = {"finish_reason": loop_res["finish_reason"]}
+        exact_usage = loop_res["usage"]
+        code_agent_trace = loop_res["agent_trace"] if agentic_mode else (loop_res["agent_trace"] or None)
+        if agentic_mode:
+            orch_ctx.metrics_ms["agent_loop_ms"] = round((time.perf_counter() - t_ag0) * 1000, 2)
+    else:
+        formatted_prompt = await service.format_messages_native(orch_ctx.enriched_messages)
+        async with orch.vram_gate:
+            ai_msg = await service.chat_with_metadata(prompt=formatted_prompt, **gen_kwargs)
+        content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
+        meta = getattr(ai_msg, "response_metadata", {}) or {}
+        exact_usage = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
 
     await orch.memory.record_chat_turn(
         query=prompt,
@@ -1273,10 +1836,16 @@ async def chat_with_uploaded_code(
         "user_id": uid,
         "session_id": sid,
         "system_prompts_count": len(sys_chain),
+        "agentic_mode": agentic_mode,
+        "agent_trace": code_agent_trace,
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": content},
+                "message": (
+                    {"role": "assistant", "content": None, "tool_calls": code_tool_calls}
+                    if code_tool_calls
+                    else {"role": "assistant", "content": content}
+                ),
                 "finish_reason": meta.get("finish_reason", "stop"),
             }
         ],
