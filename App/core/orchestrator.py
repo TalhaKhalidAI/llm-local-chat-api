@@ -554,12 +554,50 @@ class LocalEmbedder:
         return vecs.tolist()
 
 
+_BM25_STOPWORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "do", "does", "did", "will", "would", "shall", "should",
+    "can", "could", "may", "might", "must", "who", "whom", "whose", "what", "which",
+    "where", "when", "why", "how", "in", "on", "at", "by", "for", "with", "about",
+    "against", "between", "into", "through", "during", "before", "after", "above",
+    "below", "to", "from", "up", "down", "of", "off", "over", "under", "again",
+    "further", "then", "once", "here", "there", "all", "any", "both", "each", "few",
+    "more", "most", "other", "some", "such", "no", "nor", "not", "only", "own",
+    "same", "so", "than", "too", "very", "just", "now", "recent", "recently",
+    "latest", "current", "currently", "today", "tell", "me", "please", "give",
+    "show", "find", "get", "according", "based", "my", "your", "our", "their",
+    "its", "his", "her", "this", "that", "these", "those", "and", "but", "or",
+    "if", "because", "as", "until", "while", "it", "he", "she", "they", "we", "you",
+})
+
+
+def _normalize_for_tokens(text: str) -> str:
+    """Expand contractions so words like won't/don't never false-match 'won'/'don'."""
+    t = text.lower().replace("’", "'")
+    t = re.sub(r"\bwon't\b", "will not", t)
+    t = re.sub(r"\bcan't\b", "cannot", t)
+    t = re.sub(r"n't\b", " not", t)
+    t = re.sub(r"'s\b", "", t)
+    t = re.sub(r"'(re|ve|ll|d|m)\b", "", t)
+    return t
+
+
+def _extract_topic_tokens(text: str) -> List[str]:
+    """Extract meaningful non-stopword topic tokens (preserving numbers like '1' in 'Formula 1')."""
+    norm = _normalize_for_tokens(text)
+    raw = re.findall(r"[a-z0-9]+", norm)
+    tokens = [t for t in raw if (len(t) >= 2 or t.isdigit()) and t not in _BM25_STOPWORDS]
+    return tokens
+
+
 def _bm25_lexical_score(query: str, document: str) -> float:
-    """Fast Okapi BM25-style lexical overlap score for hybrid exact+semantic ranking."""
-    q_tokens = [t for t in re.findall(r"\w+", query.lower()) if len(t) >= 2]
+    """Fast Okapi BM25-style lexical overlap score over meaningful non-stopword topic tokens."""
+    q_tokens = _extract_topic_tokens(query)
+    if not q_tokens:
+        q_tokens = [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) >= 2]
     if not q_tokens:
         return 0.0
-    d_tokens = re.findall(r"\w+", document.lower())
+    d_tokens = re.findall(r"[a-z0-9]+", _normalize_for_tokens(document))
     if not d_tokens:
         return 0.0
     counts = Counter(d_tokens)
@@ -568,12 +606,13 @@ def _bm25_lexical_score(query: str, document: str) -> float:
     avg_dl = 180.0
     dl = float(len(d_tokens))
     score = 0.0
-    for qt in set(q_tokens):
+    unique_q = set(q_tokens)
+    for qt in unique_q:
         tf = counts.get(qt, 0)
         if tf > 0:
             denom = tf + k1 * (1.0 - b + b * (dl / avg_dl))
             score += (tf * (k1 + 1.0)) / denom
-    return score / max(1.0, len(set(q_tokens)))
+    return score / max(1.0, len(unique_q))
 
 
 class ChromaMemory:
@@ -715,14 +754,22 @@ class ChromaMemory:
             res.get("metadatas", [[]])[0],
             res.get("distances", [[]])[0],
         ):
+            raw_dist = float(dist)
             bm25 = _bm25_lexical_score(query, doc)
-            # Hybrid distance: boost vector distance by lexical BM25 match
-            hybrid_dist = max(0.0, float(dist) - (0.22 * bm25))
-            if hybrid_dist <= max_dist or bm25 >= 0.45:
+            # Hybrid distance: boost vector distance by meaningful topic-word BM25 match,
+            # but never allow unrelated embeddings (raw_dist > max_dist + 0.18) through unless relax_threshold=True.
+            hybrid_dist = max(0.0, raw_dist - (0.18 * bm25))
+            allow_hit = (
+                hybrid_dist <= max_dist
+                or (relax_threshold and bm25 >= 0.45)
+                or (bm25 >= 0.70 and raw_dist <= max_dist + 0.18)
+            )
+            if allow_hit:
                 candidates.append({
                     "document": doc,
                     "metadata": meta or {},
                     "distance": round(hybrid_dist, 4),
+                    "raw_distance": round(raw_dist, 4),
                     "bm25": round(bm25, 4),
                 })
 
@@ -786,7 +833,22 @@ class ChromaMemory:
 
     async def query_fresh_web_cache(self, query: str, n_results: int = 4) -> List[Dict[str, Any]]:
         cutoff = int(time.time()) - (settings.ORCH_WEB_CACHE_TTL_HOURS * 3600)
-        return await self.query("web_cache", query, n_results=n_results, where={"fetched_at": {"$gte": cutoff}})
+        raw_hits = await self.query("web_cache", query, n_results=max(n_results * 2, 6), where={"fetched_at": {"$gte": cutoff}})
+        if not raw_hits:
+            return []
+        topic_tokens = set(_extract_topic_tokens(query))
+        verified: List[Dict[str, Any]] = []
+        for hit in raw_hits:
+            meta = hit.get("metadata") or {}
+            raw_dist = float(hit.get("raw_distance", hit.get("distance", 1.0)))
+            combined_text = f"{meta.get('title', '')} {meta.get('query', '')} {hit.get('document', '')}"
+            doc_tokens = set(_extract_topic_tokens(combined_text))
+            overlap = len(topic_tokens & doc_tokens)
+            min_overlap = 1 if len(topic_tokens) <= 2 else 2
+            # Strict topical & semantic verification to prevent cross-topic web_cache pollution
+            if raw_dist <= 0.42 and (not topic_tokens or overlap >= min_overlap):
+                verified.append(hit)
+        return verified[:n_results]
 
     async def ingest_document(
         self,
@@ -1986,7 +2048,7 @@ class DuckDuckGoWebTool:
 
     @staticmethod
     def _clean_search_query(query: str) -> str:
-        """Strip conversational filler, URLs, and fix common typos so search engines match the actual topic."""
+        """Transform conversational questions into high-signal search engine queries while preserving topic entities."""
         typo_map = {
             r"\bphonex\b": "phoenix",
             r"\bpheonix\b": "phoenix",
@@ -1996,13 +2058,133 @@ class DuckDuckGoWebTool:
         cleaned = URL_EXTRACT_RE.sub(" ", query)
         for pat, repl in typo_map.items():
             cleaned = re.sub(pat, repl, cleaned, flags=re.IGNORECASE)
+
+        # Rewrite 'who won the most recent/latest <X>' -> '<X> latest winner results'
+        m_won = re.search(r"\bwho\s+won\s+(?:the\s+)?(?:most\s+recent|latest|last)?\s*(.+)", cleaned, flags=re.IGNORECASE)
+        if m_won:
+            subject = re.sub(r"[?!.,]+$", "", m_won.group(1)).strip()
+            if len(subject) >= 2:
+                return f"{subject} latest winner results"
+
         filler = re.compile(
-            r"\b(whats|what's|what is|tell me|can you|please|from internet|on internet|search internet|search web|scrap|scrape|this site|this website|in image|in the image|about it|is it|its name|what|the|in|it|is|lol|bro|dude|hey|hay)\b",
+            r"\b(whats|what's|what is|what are|can you|could you|would you|tell me|please|from internet|on internet|"
+            r"search internet|search the web|search web|look up|scrap|scrape|this site|this website|"
+            r"in image|in the image|about it|is it|its name|right now|as of today|lol|bro|dude|hey|hay)\b",
             re.IGNORECASE,
         )
         cleaned = filler.sub(" ", cleaned)
+        cleaned = re.sub(r"^\s*(?:what|which|where|when|how)\s+(?:is|are|was|were)\s+(?:the\s+)?", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\b(?:the|a|an)\b", " ", cleaned, flags=re.IGNORECASE)
         cleaned = re.sub(r"\s+", " ", cleaned).strip(" ?!.,")
         return cleaned if len(cleaned) >= 3 else query.strip()
+
+    @staticmethod
+    def _weather_search_sync(query: str) -> List[Dict[str, str]]:
+        """Direct zero-key Open-Meteo + wttr.in live weather lookup when user asks about weather/temperature."""
+        if not re.search(r"\b(weather|temperature|forecast|humidity|rain|wind)\b", query, re.IGNORECASE):
+            return []
+        import httpx
+
+        # Extract location candidate from query (e.g. 'current weather in Lahore today' -> 'Lahore')
+        loc = ""
+        m_loc = re.search(
+            r"\b(?:in|for|at|of)\s+([A-Za-z][A-Za-z\s\-]{1,35}?)(?:\s+(?:today|now|right now|currently|tomorrow|this week)|[?!.,]|$)",
+            query,
+            flags=re.IGNORECASE,
+        )
+        if m_loc:
+            loc = m_loc.group(1).strip()
+        if not loc:
+            rem = re.sub(
+                r"\b(what|whats|what's|is|the|current|latest|today|today's|now|right|weather|temperature|forecast|humidity|rain|wind|in|for|at|of|tell|me|please|check)\b",
+                " ",
+                query,
+                flags=re.IGNORECASE,
+            )
+            loc = re.sub(r"\s+", " ", rem).strip(" ?!.,")
+        if not loc or len(loc) < 2:
+            return []
+
+        results: List[Dict[str, str]] = []
+        headers = {"User-Agent": "LocalOrchestrator/2.0"}
+        wmo_codes = {
+            0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+            45: "Foggy", 48: "Rime fog", 51: "Light drizzle", 53: "Moderate drizzle",
+            55: "Dense drizzle", 61: "Slight rain", 63: "Moderate rain", 65: "Heavy rain",
+            71: "Slight snow", 73: "Moderate snow", 75: "Heavy snow", 80: "Rain showers",
+            81: "Moderate rain showers", 82: "Heavy rain showers", 95: "Thunderstorm",
+        }
+        try:
+            geo = httpx.get(
+                "https://geocoding-api.open-meteo.com/v1/search",
+                params={"name": loc, "count": 1, "language": "en", "format": "json"},
+                headers=headers,
+                timeout=min(3.5, settings.ORCH_SCRAPE_TIMEOUT_SEC),
+            )
+            if geo.status_code == 200:
+                g_items = geo.json().get("results") or []
+                if g_items:
+                    g = g_items[0]
+                    lat, lon = g["latitude"], g["longitude"]
+                    place = f"{g.get('name', loc)}, {g.get('country', '')}".strip(", ")
+                    wx = httpx.get(
+                        "https://api.open-meteo.com/v1/forecast",
+                        params={
+                            "latitude": lat,
+                            "longitude": lon,
+                            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,wind_speed_10m,surface_pressure,weather_code",
+                            "timezone": "auto",
+                        },
+                        headers=headers,
+                        timeout=min(3.5, settings.ORCH_SCRAPE_TIMEOUT_SEC),
+                    )
+                    if wx.status_code == 200:
+                        cur = wx.json().get("current") or {}
+                        cond = wmo_codes.get(cur.get("weather_code"), "Unknown")
+                        summary = (
+                            f"Live Weather for {place} (Observed at {cur.get('time', 'now')}): "
+                            f"Condition: {cond}, Temperature: {cur.get('temperature_2m')}°C "
+                            f"(Feels like: {cur.get('apparent_temperature')}°C), "
+                            f"Humidity: {cur.get('relative_humidity_2m')}%, "
+                            f"Wind Speed: {cur.get('wind_speed_10m')} km/h, "
+                            f"Surface Pressure: {cur.get('surface_pressure')} hPa."
+                        )
+                        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=temperature_2m,relative_humidity_2m,wind_speed_10m"
+                        results.append({
+                            "title": f"Open-Meteo Live Weather: {place}",
+                            "url": url,
+                            "snippet": summary,
+                        })
+                        return results
+        except Exception as exc:
+            logger.debug(f"Open-Meteo lookup skipped: {exc}")
+
+        try:
+            wt = httpx.get(
+                f"https://wttr.in/{loc}",
+                params={"format": "j1"},
+                headers=headers,
+                timeout=min(3.5, settings.ORCH_SCRAPE_TIMEOUT_SEC),
+                follow_redirects=True,
+            )
+            if wt.status_code == 200:
+                cc = (wt.json().get("current_condition") or [{}])[0]
+                desc_list = cc.get("weatherDesc") or [{}]
+                cond_txt = desc_list[0].get("value", "") if desc_list else ""
+                summary = (
+                    f"Live Weather for {loc}: Condition: {cond_txt}, "
+                    f"Temperature: {cc.get('temp_C')}°C (Feels like: {cc.get('FeelsLikeC')}°C), "
+                    f"Humidity: {cc.get('humidity')}%, Wind Speed: {cc.get('windspeedKmph')} km/h, "
+                    f"Pressure: {cc.get('pressure')} hPa, Visibility: {cc.get('visibility')} km."
+                )
+                results.append({
+                    "title": f"wttr.in Live Weather: {loc}",
+                    "url": f"https://wttr.in/{loc}",
+                    "snippet": summary,
+                })
+        except Exception as exc:
+            logger.debug(f"wttr.in lookup skipped: {exc}")
+        return results
 
     @staticmethod
     def _youtube_search_sync(query: str) -> List[Dict[str, str]]:
@@ -2131,38 +2313,27 @@ class DuckDuckGoWebTool:
 
     @staticmethod
     def _rss_search_sync(query: str) -> List[Dict[str, str]]:
-        """Reliable Meta-Search combining YouTube, Wikipedia, ArXiv, Reddit, Bing News RSS, and Google News RSS."""
+        """Reliable Meta-Search combining Live Weather, YouTube, Google/Bing News RSS (topic-filtered), Wikipedia, ArXiv, and Reddit."""
         import httpx
 
         results: List[Dict[str, str]] = []
         seen_urls: set[str] = set()
+        topic_tokens = set(_extract_topic_tokens(query))
+
+        for wx in DuckDuckGoWebTool._weather_search_sync(query):
+            seen_urls.add(wx["url"])
+            results.append(wx)
 
         if re.search(r"\b(youtube|video|tutorial|watch)\b", query, re.IGNORECASE):
             for yt in DuckDuckGoWebTool._youtube_search_sync(query):
                 seen_urls.add(yt["url"])
                 results.append(yt)
 
-        for wk in DuckDuckGoWebTool._wikipedia_search_sync(query):
-            if wk["url"] not in seen_urls:
-                seen_urls.add(wk["url"])
-                results.append(wk)
-
-        if re.search(r"\b(paper|arxiv|study|research|physics|theorem|equation|algorithm|quantum|black hole|relativity|model)\b", query, re.IGNORECASE):
-            for ax in DuckDuckGoWebTool._arxiv_search_sync(query):
-                if ax["url"] not in seen_urls:
-                    seen_urls.add(ax["url"])
-                    results.append(ax)
-
-        if re.search(r"\b(reddit|forum|review|opinion|fix|error|bug|vs)\b", query, re.IGNORECASE):
-            for rd in DuckDuckGoWebTool._reddit_search_sync(query):
-                if rd["url"] not in seen_urls:
-                    seen_urls.add(rd["url"])
-                    results.append(rd)
-
         headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) LocalOrchestrator/2.0"}
+        # Prefer Google News RSS first (higher topical precision); Bing News RSS second with strict topic check
         feeds = [
-            ("https://www.bing.com/news/search", {"q": query, "format": "rss"}),
             ("https://news.google.com/rss/search", {"q": query, "hl": "en-US", "gl": "US", "ceid": "US:en"}),
+            ("https://www.bing.com/news/search", {"q": query, "format": "rss"}),
         ]
         for base_url, params in feeds:
             if len(results) >= settings.ORCH_DDG_MAX_RESULTS:
@@ -2179,6 +2350,12 @@ class DuckDuckGoWebTool:
                     desc = re.sub(r"\s+", " ", desc).strip()
                     pub = (item.findtext("pubDate") or "").strip()
 
+                    # Reject generic global headlines when feed falls back on non-matching queries
+                    if topic_tokens:
+                        item_tokens = set(_extract_topic_tokens(f"{title} {desc}"))
+                        if not (topic_tokens & item_tokens):
+                            continue
+
                     final_url = raw_link
                     if "bing.com/news/apiclick.aspx" in raw_link:
                         real_u = parse_qs(urlparse(raw_link).query).get("url", [""])[0]
@@ -2194,28 +2371,69 @@ class DuckDuckGoWebTool:
                         break
             except Exception as exc:
                 logger.warning(f"RSS feed {base_url} failed: {exc}")
-        return results
+
+        if len(results) < settings.ORCH_DDG_MAX_RESULTS:
+            for wk in DuckDuckGoWebTool._wikipedia_search_sync(query):
+                if wk["url"] not in seen_urls:
+                    seen_urls.add(wk["url"])
+                    results.append(wk)
+
+        if re.search(r"\b(paper|arxiv|study|research|physics|theorem|equation|algorithm|quantum|black hole|relativity|model)\b", query, re.IGNORECASE):
+            for ax in DuckDuckGoWebTool._arxiv_search_sync(query):
+                if ax["url"] not in seen_urls:
+                    seen_urls.add(ax["url"])
+                    results.append(ax)
+
+        if re.search(r"\b(reddit|forum|review|opinion|fix|error|bug|vs)\b", query, re.IGNORECASE):
+            for rd in DuckDuckGoWebTool._reddit_search_sync(query):
+                if rd["url"] not in seen_urls:
+                    seen_urls.add(rd["url"])
+                    results.append(rd)
+
+        return results[: settings.ORCH_DDG_MAX_RESULTS]
 
     def _ddg_search_sync(self, query: str) -> List[Dict[str, str]]:
         clean_q = self._clean_search_query(query)
+        weather_hits = self._weather_search_sync(query)
+        is_news_or_winner = bool(re.search(r"\b(winner|won|latest|recent|today|news|score|standings|grand prix)\b", query, re.IGNORECASE))
         try:
             from ddgs import DDGS
-            results: List[Dict[str, str]] = []
+            results: List[Dict[str, str]] = list(weather_hits)
+            seen = {r["url"] for r in results}
             with DDGS() as ddgs:
+                if is_news_or_winner:
+                    try:
+                        for item in ddgs.news(clean_q, max_results=max(2, settings.ORCH_DDG_MAX_RESULTS // 2)):
+                            url = item.get("url") or item.get("href") or ""
+                            if url and url not in seen:
+                                seen.add(url)
+                                date_prefix = f"[{item.get('date')}] " if item.get("date") else ""
+                                results.append({
+                                    "title": item.get("title", "News Result"),
+                                    "url": url,
+                                    "snippet": f"{date_prefix}{item.get('body', '')}".strip(),
+                                })
+                    except Exception:
+                        pass
                 for item in ddgs.text(clean_q, max_results=settings.ORCH_DDG_MAX_RESULTS):
                     url = item.get("href") or item.get("link") or ""
-                    if url:
+                    if url and url not in seen:
+                        seen.add(url)
                         results.append({
                             "title": item.get("title", "Untitled"),
                             "url": url,
                             "snippet": item.get("body", ""),
                         })
+                    if len(results) >= settings.ORCH_DDG_MAX_RESULTS:
+                        break
             if results:
-                return results
+                return results[: settings.ORCH_DDG_MAX_RESULTS]
         except ImportError:
             pass
         except Exception as exc:
             logger.warning(f"ddgs search failed ({exc}); trying fallback")
+            if weather_hits:
+                return weather_hits
 
         try:
             import httpx
@@ -3204,7 +3422,13 @@ class VisionDescriberTool:
 
 class IntentRouter:
     WEB_PATTERNS = re.compile(
-        r"\b(latest|today|current|news|price|weather|2025|2026|who won|release date|stock|score|search web|internet|scrap|scrape|website|url|link|youtube)\b",
+        r"\b(latest|most recent|today|current|right now|news|price|weather|temperature|forecast|humidity|"
+        r"2024|2025|2026|2027|who won|winner|standings|release date|stock|score|search (the )?web|"
+        r"internet|scrap|scrape|website|url|link|youtube)\b",
+        re.IGNORECASE,
+    )
+    EXPLICIT_WEB_OVERRIDE = re.compile(
+        r"\b(search (the )?web|internet|online|website|scrap|scrape|youtube)\b",
         re.IGNORECASE,
     )
     IMAGE_SEARCH_PATTERNS = re.compile(
@@ -3212,7 +3436,16 @@ class IntentRouter:
         re.IGNORECASE,
     )
     RAG_PATTERNS = re.compile(
-        r"\b(my docs|my notes|in my files|from (the )?(pdf|document|doc|file|excel|csv|sheet|contract|report|book|knowledge base|chroma)|remember|page \d+)\b",
+        r"\b("
+        r"my (local )?(docs?|documents?|notes?|files?|pdfs?|data|knowledge\s*base)|"
+        r"our (local )?(docs?|documents?|notes?|files?)|"
+        r"local (docs?|documents?|files?|notes?|knowledge\s*base)|"
+        r"uploaded (docs?|documents?|files?|pdfs?)|"
+        r"in my (local )?(files?|docs?|documents?|notes?)|"
+        r"according to (my|our|the) (local )?(docs?|documents?|files?|notes?|pdf|report)|"
+        r"from (the |my )?(pdf|documents?|docs?|files?|excel|csv|sheet|contract|report|book|knowledge base|chroma)|"
+        r"remember|page \d+"
+        r")\b",
         re.IGNORECASE,
     )
 
@@ -3227,8 +3460,14 @@ class IntentRouter:
     ) -> RouteDecision:
         q = query.strip()
         direct_urls = extract_urls_from_text(q)
-        use_web = bool(direct_urls) or (force_web if force_web is not None else bool(cls.WEB_PATTERNS.search(q)))
-        use_rag = has_document or (force_rag if force_rag is not None else bool(cls.RAG_PATTERNS.search(q)))
+        explicit_rag = bool(cls.RAG_PATTERNS.search(q))
+        web_match = bool(cls.WEB_PATTERNS.search(q))
+        # If user explicitly asks about their local/uploaded documents without asking for web/URL, don't hijack to web
+        if explicit_rag and force_web is None and not direct_urls and not cls.EXPLICIT_WEB_OVERRIDE.search(q):
+            web_match = False
+
+        use_web = bool(direct_urls) or (force_web if force_web is not None else web_match)
+        use_rag = has_document or (force_rag if force_rag is not None else explicit_rag)
         use_image_search = bool(cls.IMAGE_SEARCH_PATTERNS.search(q)) and not has_image
 
         return RouteDecision(
@@ -3729,12 +3968,53 @@ class ChatOrchestrator:
         # =============================================================
         sys_sections: List[str] = [base_model_persona]
 
+        explicit_local_doc_query = bool(
+            force_rag is True
+            or (
+                IntentRouter.RAG_PATTERNS.search(user_query)
+                and not re.fullmatch(r"\s*remember\b.*", user_query, flags=re.IGNORECASE)
+            )
+        )
+        missing_local_docs = bool(explicit_local_doc_query and not document_report and not results.get("rag"))
+        if missing_local_docs:
+            blocks.append(
+                "<local_documents_status>\n"
+                f"0 local or uploaded documents were found in ChromaDB (`docs_rag`) for user_id='{uid}' and session_id='{sid}', "
+                "and no file was uploaded with this request.\n"
+                "</local_documents_status>"
+            )
+
+        missing_live_web = bool(route.use_web and not results.get("web") and not vision_report and not document_report)
+
         core_directives: List[str] = [
             "Use <conversation_memory> to recall facts and preferences the user told you previously in this session.",
             "Answer directly, truthfully, and thoroughly using the facts, tables, pages, memory, and exact URLs provided in <context>.",
-            "Cite sources as [1], [2] when referencing web search or document context.",
-            "Do NOT say you cannot remember previous interactions, cannot read files, cannot scrape websites, or lack internet access.",
         ]
+        if citations:
+            core_directives.append(
+                "Cite numbered sources inline as [1], [2] ONLY when referencing the numbered sources provided inside <context>."
+            )
+        else:
+            core_directives.append(
+                "No numbered external sources are present in <context>; do NOT invent fake [1], [2], or [Document X] citation tags or fabricated URLs."
+            )
+
+        if missing_local_docs:
+            core_directives.append(
+                "[CRITICAL DIRECTIVE - NO LOCAL DOCUMENTS FOUND]:\n"
+                "The user explicitly asked about their local/uploaded documents or files, but ZERO matching documents exist in the current session (<local_documents_status>). "
+                "You MUST clearly tell the user that no local documents were found or uploaded in this session, and ask them to upload the document or pass the matching user_id/session_id. "
+                "You MUST NOT fabricate document contents, steps, project acronyms, or fake [Document 1] citations."
+            )
+        elif missing_live_web:
+            core_directives.append(
+                "[CRITICAL DIRECTIVE - LIVE WEB RESULTS UNAVAILABLE]:\n"
+                "Live web search returned no verified results for this query. Do NOT invent fake real-time numbers (such as live temperatures, scores, or prices) or fake citation URLs; state honestly that live web data could not be retrieved right now."
+            )
+        else:
+            core_directives.append(
+                "Do NOT say you cannot remember previous interactions, cannot read files, cannot scrape websites, or lack internet access when relevant data is provided in <context>."
+            )
         if vision_report:
             core_directives.append(
                 "[CRITICAL DIRECTIVE - USER IMAGE & CODE ANALYSIS]:\n"

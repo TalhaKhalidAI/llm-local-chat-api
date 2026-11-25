@@ -1,146 +1,142 @@
-from datetime import datetime
+# App/repository/userRepository.py
+from datetime import datetime, timezone
 from typing import Optional, List, Dict, Any
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, and_, func, update, delete
 from App.api.databases.Users import User
 
 
 class UserRepository:
-    def __init__(self, db: Session):
+    """
+    Data Access Layer (Repository).
+    Pure database queries with no HTTP/FastAPI exceptions or business logic.
+    All methods are asynchronous and operate directly on the database session.
+    """
+
+    def __init__(self, db: AsyncSession):
         self.db = db
 
-    def get_by_id(self, user_id: int) -> Optional[User]:
+    async def get_by_id(self, user_id: int) -> Optional[User]:
         """Get user by ID"""
-        return self.db.query(User).filter(
-            User.id == user_id,
-            User.is_deleted == False
-        ).first()
+        stmt = select(User).where(and_(User.id == user_id, User.is_deleted == False))
+        result = await self.db.execute(stmt)
+        return result.scalars().first()
 
-    def get_by_username(self, username: str) -> Optional[User]:
+    async def get_by_id_include_deleted(self, user_id: int) -> Optional[User]:
+        """Get user by ID including deleted"""
+        stmt = select(User).where(User.id == user_id)
+        result = await self.db.execute(stmt)
+        return result.scalars().first()
+
+    async def get_by_username(self, username: str) -> Optional[User]:
         """Get user by username"""
-        return self.db.query(User).filter(
-            User.username == username,
-            User.is_deleted == False
-        ).first()
+        stmt = select(User).where(and_(User.username == username, User.is_deleted == False))
+        result = await self.db.execute(stmt)
+        return result.scalars().first()
 
-    def get_by_email(self, email: str) -> Optional[User]:
+    async def get_by_email(self, email: str) -> Optional[User]:
         """Get user by email"""
-        return self.db.query(User).filter(
-            User.email == email,
-            User.is_deleted == False
-        ).first()
+        stmt = select(User).where(and_(User.email == email, User.is_deleted == False))
+        result = await self.db.execute(stmt)
+        return result.scalars().first()
 
-    def get_users(self, skip: int = 0, limit: int = 100) -> List[User]:
-        """Get all active users"""
-        return self.db.query(User).filter(
-            User.is_deleted == False
-        ).offset(skip).limit(limit).all()
+    async def get_users(self, skip: int = 0, limit: int = 100) -> List[User]:
+        """Get active users with pagination"""
+        stmt = select(User).where(User.is_deleted == False).offset(skip).limit(limit)
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
 
-    def create_user(self, user_data: Dict[str, Any]) -> User:
-        """Create a new user (signup)"""
+    async def count_active_users(self) -> int:
+        """Get total count of active users"""
+        stmt = select(func.count(User.id)).where(User.is_deleted == False)
+        result = await self.db.execute(stmt)
+        return result.scalar() or 0
+
+    async def create_user(self, user_data: Dict[str, Any]) -> User:
+        """Create and persist a new user"""
         db_user = User(**user_data)
         self.db.add(db_user)
-        self.db.commit()
-        self.db.refresh(db_user)
+        await self.db.flush()
+        await self.db.refresh(db_user)
         return db_user
 
-    def update_user(self, user_id: int, update_data: Dict[str, Any]) -> Optional[User]:
-        """Update user information"""
-        db_user = self.db.query(User).filter(
-            User.id == user_id,
-            User.is_deleted == False
-        ).first()
-        
+    async def update_user(self, user_id: int, update_data: Dict[str, Any]) -> Optional[User]:
+        """Update user columns"""
+        db_user = await self.get_by_id(user_id)
         if db_user:
             for key, value in update_data.items():
                 if hasattr(db_user, key) and key not in ['id', 'password_hash']:
                     setattr(db_user, key, value)
-            self.db.commit()
-            self.db.refresh(db_user)
+            await self.db.flush()
+            await self.db.refresh(db_user)
         return db_user
 
-    def delete_user(self, user_id: int, soft_delete: bool = True) -> bool:
-        """Delete user - soft delete by default, hard delete if specified"""
-        db_user = self.db.query(User).filter(User.id == user_id).first()
+    async def delete_user(self, user_id: int, soft_delete: bool = True) -> bool:
+        """Soft or hard delete user"""
+        stmt = select(User).where(User.id == user_id)
+        result = await self.db.execute(stmt)
+        db_user = result.scalars().first()
         if not db_user:
             return False
-        
+
         if soft_delete:
-            # Soft Delete
             db_user.is_deleted = True
-            db_user.deleted_at = datetime.utcnow()
+            db_user.deleted_at = datetime.now(timezone.utc)
             db_user.is_active = False
-            self.db.commit()
+            await self.db.flush()
         else:
-            # Hard Delete
-            self.db.delete(db_user)
-            self.db.commit()
+            await self.db.delete(db_user)
+            await self.db.flush()
         return True
 
-    def restore_user(self, user_id: int) -> Optional[User]:
+    async def restore_user(self, user_id: int) -> Optional[User]:
         """Restore a soft-deleted user"""
-        db_user = self.db.query(User).filter(
-            User.id == user_id,
-            User.is_deleted == True
-        ).first()
-        
+        stmt = select(User).where(and_(User.id == user_id, User.is_deleted == True))
+        result = await self.db.execute(stmt)
+        db_user = result.scalars().first()
         if db_user:
             db_user.is_deleted = False
             db_user.deleted_at = None
             db_user.is_active = True
-            self.db.commit()
-            self.db.refresh(db_user)
+            await self.db.flush()
+            await self.db.refresh(db_user)
         return db_user
 
-    def authenticate(self, username: str, password: str) -> Optional[User]:
-        """Authenticate user by username and password - returns user if valid"""
-        user = self.get_by_username(username)
-        if not user:
-            return None
-        # Note: Password verification is done in auth.py using verify_password
-        return user
-
-    def change_password(self, user_id: int, new_password_hash: str) -> bool:
-        """Change user password"""
-        db_user = self.get_by_id(user_id)
+    async def change_password(self, user_id: int, new_password_hash: str) -> bool:
+        """Update user password hash"""
+        db_user = await self.get_by_id(user_id)
         if not db_user:
             return False
-        
         db_user.password_hash = new_password_hash
-        self.db.commit()
+        await self.db.flush()
         return True
 
-    def deactivate_user(self, user_id: int) -> bool:
-        """Deactivate user account (soft disable)"""
-        db_user = self.get_by_id(user_id)
+    async def deactivate_user(self, user_id: int) -> bool:
+        """Deactivate user"""
+        db_user = await self.get_by_id(user_id)
         if not db_user:
             return False
-        
         db_user.disabled = True
         db_user.is_active = False
-        self.db.commit()
+        await self.db.flush()
         return True
 
-    def activate_user(self, user_id: int) -> bool:
-        """Activate user account"""
-        db_user = self.get_by_id(user_id)
+    async def activate_user(self, user_id: int) -> bool:
+        """Activate user"""
+        db_user = await self.get_by_id(user_id)
         if not db_user:
             return False
-        
         db_user.disabled = False
         db_user.is_active = True
-        self.db.commit()
+        await self.db.flush()
         return True
 
-    def get_deleted_users(self) -> List[User]:
+    async def get_deleted_users(self) -> List[User]:
         """Get all soft-deleted users"""
-        return self.db.query(User).filter(User.is_deleted == True).all()
+        stmt = select(User).where(User.is_deleted == True)
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
 
-    def reset_password(self, user_id: int, new_password_hash: str) -> bool:
-        """Reset user password (admin only)"""
-        db_user = self.get_by_id(user_id)
-        if not db_user:
-            return False
-        
-        db_user.password_hash = new_password_hash
-        self.db.commit()
-        return True
+    async def reset_password(self, user_id: int, new_password_hash: str) -> bool:
+        """Reset password hash"""
+        return await self.change_password(user_id, new_password_hash)

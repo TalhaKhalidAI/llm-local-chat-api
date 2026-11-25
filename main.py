@@ -11,6 +11,16 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from App.api.v1 import v1_router
+
+from App.core.RedisConnector import redis_client
+from App.middleware.rate_limit_middleware import GlobalRateLimitMiddleware
+from App.middleware.kill_switch_middleware import KillSwitchMiddleware
+from App.middleware.body_size_middleware import BodySizeLimitMiddleware
+from App.middleware.request_id_middleware import RequestIDMiddleware
+from App.middleware.gzip_request_middleware import GZipRequestMiddleware
+from App.middleware.gzip_response_middleware import GZipResponseMiddleware
+from App.middleware.idempotency_middleware import IdempotencyMiddleware
+
 from App.core.settings import settings
 from App.core.LoggingInit import get_core_logger
 from App.core.exceptions import AppError
@@ -27,49 +37,70 @@ limiter = Limiter(
     default_limits=[settings.RATE_LIMIT_DEFAULT] if settings.RATE_LIMIT_DEFAULT else ["100/minute"]
 )
 
-def create_default_admin():
-    """Create default admin user on startup if not exists"""
-    from App.api.dependencies.sqlite_connector import SessionLocal
+async def create_default_admin():
+    """Create default admin user on startup if not exists asynchronously"""
+    from App.api.dependencies.sqlite_connector import AsyncSessionLocal
+    from App.api.databases.Users import init_db
     from App.repository.userRepository import UserRepository
     from App.api.dependencies.auth import get_password_hash
     
-    db = SessionLocal()
+    # Ensure tables are created asynchronously
     try:
-        repo = UserRepository(db)
-        admin_username = os.getenv("ADMIN_USERNAME", "admin")
-        admin_email = os.getenv("ADMIN_EMAIL", "admin@example.com")
-        admin_password = os.getenv("ADMIN_PASSWORD", "Admin@123")
-        
-        # Check if admin exists
-        existing_admin = repo.get_by_username(admin_username)
-        if not existing_admin:
-            admin_data = {
-                "username": admin_username,
-                "email": admin_email,
-                "full_name": "System Administrator",
-                "password_hash": get_password_hash(admin_password),
-                "user_role": "admin",
-                "is_active": True,
-                "disabled": False,
-                "is_admin": True
-            }
-            repo.create_user(admin_data)
-            logger.info(f"Default admin user created: {admin_username}")
-        else:
-            logger.info(f"Admin user already exists: {admin_username}")
+        await init_db()
     except Exception as e:
-        logger.error(f"Error creating default admin: {e}")
-    finally:
-        db.close()
+        logger.error(f"Database schema initialization error: {e}")
+
+    async with AsyncSessionLocal() as session:
+        try:
+            repo = UserRepository(session)
+            admin_username = os.getenv("ADMIN_USERNAME", "admin")
+            admin_email = os.getenv("ADMIN_EMAIL", "admin@example.com")
+            admin_password = os.getenv("ADMIN_PASSWORD", "Admin@123")
+            
+            # Check if admin exists
+            existing_admin = await repo.get_by_username(admin_username)
+            if not existing_admin:
+                admin_data = {
+                    "username": admin_username,
+                    "email": admin_email,
+                    "full_name": "System Administrator",
+                    "password_hash": get_password_hash(admin_password),
+                    "user_role": "admin",
+                    "is_active": True,
+                    "disabled": False,
+                    "is_admin": True
+                }
+                await repo.create_user(admin_data)
+                await session.commit()
+                logger.info(f"Default admin user created: {admin_username}")
+            else:
+                logger.info(f"Admin user already exists: {admin_username}")
+        except Exception as e:
+            await session.rollback()
+            logger.error(f"Error creating default admin: {e}")
 
 @asynccontextmanager
 async def lifespan(app):
     logger.info("App started")
     
+    # Connect Redis
+    try:
+        await redis_client.connect()
+        logger.info("Connected to Redis")
+    except Exception as e:
+        logger.warning(f"Redis connection failed during startup (fail-open mode active): {e}")
+    
     # Create default admin user
-    create_default_admin()
+    await create_default_admin()
     
     yield
+    
+    # Disconnect Redis
+    try:
+        await redis_client.disconnect()
+        logger.info("Disconnected from Redis")
+    except Exception:
+        pass
     logger.info("app end")
 
 app = FastAPI(title="Langchain API", version="0.0.1", lifespan=lifespan)
@@ -101,6 +132,113 @@ async def custom_rate_limit_handler(request: Request, exc: RateLimitExceeded):
         content={"error": f"Rate limit exceeded: {detail}"}
     )
 
+
+
+# ============================================================================
+# DOMAIN & INFRASTRUCTURE EXCEPTION HANDLERS
+# ============================================================================
+from App.core.exceptions import (
+    DomainError,
+    InfrastructureError,
+    UserNotFoundError,
+    DuplicateEmailError,
+    DuplicateNameError,
+    IncorrectPasswordError,
+    AccountAlreadyDisabledError,
+    AccountNotDisabledError,
+    PermissionDeniedError,
+    RateLimitError,
+    MFARequiredError,
+    InvalidMFACodeError,
+)
+
+@app.exception_handler(InfrastructureError)
+async def infrastructure_error_handler(request: Request, exc: InfrastructureError):
+    req_id = getattr(request.state, "request_id", "-")
+    logger.error(f"[RequestID: {req_id}] Infrastructure Error: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content=jsonable_encoder({
+            "detail": str(exc) or "Service temporarily unavailable",
+            "error_code": "INFRASTRUCTURE_UNAVAILABLE",
+            "request_id": req_id,
+        })
+    )
+
+@app.exception_handler(UserNotFoundError)
+async def user_not_found_handler(request: Request, exc: UserNotFoundError):
+    req_id = getattr(request.state, "request_id", "-")
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content=jsonable_encoder({
+            "detail": str(exc) or "User not found",
+            "error_code": "USER_NOT_FOUND",
+            "request_id": req_id,
+        })
+    )
+
+@app.exception_handler(DuplicateEmailError)
+@app.exception_handler(DuplicateNameError)
+async def duplicate_entity_handler(request: Request, exc: DomainError):
+    req_id = getattr(request.state, "request_id", "-")
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=jsonable_encoder({
+            "detail": str(exc),
+            "error_code": "DUPLICATE_RESOURCE",
+            "request_id": req_id,
+        })
+    )
+
+@app.exception_handler(IncorrectPasswordError)
+async def incorrect_password_handler(request: Request, exc: IncorrectPasswordError):
+    req_id = getattr(request.state, "request_id", "-")
+    return JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        headers={"WWW-Authenticate": "Bearer"},
+        content=jsonable_encoder({
+            "detail": str(exc) or "Incorrect username or password",
+            "error_code": "INCORRECT_CREDENTIALS",
+            "request_id": req_id,
+        })
+    )
+
+@app.exception_handler(AccountAlreadyDisabledError)
+async def account_disabled_handler(request: Request, exc: AccountAlreadyDisabledError):
+    req_id = getattr(request.state, "request_id", "-")
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=jsonable_encoder({
+            "detail": str(exc) or "Account is disabled",
+            "error_code": "ACCOUNT_DISABLED",
+            "request_id": req_id,
+        })
+    )
+
+@app.exception_handler(PermissionDeniedError)
+async def permission_denied_handler(request: Request, exc: PermissionDeniedError):
+    req_id = getattr(request.state, "request_id", "-")
+    return JSONResponse(
+        status_code=status.HTTP_403_FORBIDDEN,
+        content=jsonable_encoder({
+            "detail": str(exc) or "Permission denied",
+            "error_code": "PERMISSION_DENIED",
+            "request_id": req_id,
+        })
+    )
+
+@app.exception_handler(DomainError)
+async def generic_domain_error_handler(request: Request, exc: DomainError):
+    req_id = getattr(request.state, "request_id", "-")
+    logger.warning(f"[RequestID: {req_id}] Domain Error: {exc}")
+    return JSONResponse(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        content=jsonable_encoder({
+            "detail": str(exc),
+            "error_code": "DOMAIN_ERROR",
+            "request_id": req_id,
+        })
+    )
 
 @app.exception_handler(AppError)
 async def app_error_handler(request: Request, exc: AppError):
@@ -187,14 +325,14 @@ async def kill_switch_middleware(request: Request, call_next):
     )
     
     # Check both manual and automatic kill switches
-    is_killed = settings.KILL_SWITCH_ENABLED or app.state.auto_kill_enabled
+    is_killed = settings.KILL_SWITCH_ENABLED or getattr(app.state, "auto_kill_enabled", False)
     
     if is_killed and not is_whitelisted:
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
                 "detail": "Service is temporarily unavailable due to maintenance.",
-                "type": "auto_kill" if app.state.auto_kill_enabled else "manual_kill"
+                "type": "auto_kill" if getattr(app.state, "auto_kill_enabled", False) else "manual_kill"
             }
         )
     
@@ -212,25 +350,35 @@ async def kill_switch_middleware(request: Request, call_next):
         )
 
 # Add Middlewares (Order: Outermost -> Innermost)
-# 1. CORS (Outermost)
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*").split(",")
+# Middleware Stack -- order matters (last added = outermost)
+# ============================================================================
+app.add_middleware(GZipResponseMiddleware)
+app.add_middleware(GZipRequestMiddleware)
+app.add_middleware(BodySizeLimitMiddleware, max_size=settings.MAX_BODY_SIZE)
+app.add_middleware(RequestIDMiddleware, header_name="X-Request-ID")   # innermost
+app.add_middleware(
+    GlobalRateLimitMiddleware,
+    default_limit=settings.RATE_LIMIT_DEFAULT or "100/minute",
+)
+app.add_middleware(KillSwitchMiddleware, recovery_seconds=60)
+app.add_middleware(IdempotencyMiddleware)
+
+# Outermost CORS
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     allow_headers=["*"],
 )
-
-# 2. Rate Limiter Middleware (Inner)
-app.add_middleware(SlowAPIMiddleware)
 
 
 
 @app.get("/health", status_code=status.HTTP_200_OK, tags=["System"])
 async def health_check():
     """Simple health check endpoint for monitoring"""
-    return {"status": "healthy", "version": "0.0.1", "auto_kill_enabled": app.state.auto_kill_enabled}
+    return {"status": "healthy", "version": "0.0.1", "auto_kill_enabled": getattr(app.state, "auto_kill_enabled", False)}
 
 
 @app.post("/reset-kill-switch", status_code=status.HTTP_200_OK, tags=["System"])

@@ -5,7 +5,7 @@ from argon2 import PasswordHasher, exceptions as argon2_exceptions
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from App.core.settings import settings
 from App.api.dependencies.sqlite_connector import get_db
@@ -116,7 +116,7 @@ def decode_jwt(token: str) -> Optional[Dict[str, Any]]:
 bearer_scheme = HTTPBearer(auto_error=False)  # auto_error=False allows optional auth
 async def get_current_user(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(bearer_scheme),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ) -> Dict[str, Any]:
     """Get current authenticated user from token - FIXED"""
     
@@ -186,7 +186,7 @@ async def get_current_user(
     # Get user from database using repository
     try:
         repo = UserRepository(db)
-        user = repo.get_by_id(user_id)
+        user = await repo.get_by_id(user_id)
         
         if not user:
             logger.warning(f"User not found for ID: {user_id}")
@@ -252,12 +252,12 @@ async def get_admin_user(
 async def authenticate_user(
     uname: str,
     password: str,
-    db: Session
+    db: AsyncSession
 ) -> Optional[Dict[str, Any]]:
     """Authenticate user by username and password - UPDATED"""
     try:
         repo = UserRepository(db)
-        user = repo.get_by_username(uname)
+        user = await repo.get_by_username(uname)
         
         # Check if user exists
         if not user:
@@ -331,7 +331,7 @@ def create_refresh_token(data: Dict[str, Any]) -> str:
         algorithm=settings.ALGORITHM
     )
 
-async def refresh_access_token(refresh_token: str, db: Session) -> Optional[str]:
+async def refresh_access_token(refresh_token: str, db: AsyncSession) -> Optional[str]:
     """Refresh access token using refresh token"""
     try:
         payload = decode_jwt(refresh_token)
@@ -343,7 +343,7 @@ async def refresh_access_token(refresh_token: str, db: Session) -> Optional[str]
             return None
         
         repo = UserRepository(db)
-        user = repo.get_by_id(user_id)
+        user = await repo.get_by_id(user_id)
         
         if not user or user.disabled or not user.is_active:
             return None
@@ -365,7 +365,7 @@ async def refresh_access_token(refresh_token: str, db: Session) -> Optional[str]
 # Additional dependency for optional authentication
 async def get_current_user_optional(
     token: Optional[str] = Depends(oauth2_scheme),
-    db: Session = Depends(get_db)
+    db: AsyncSession = Depends(get_db)
 ) -> Optional[Dict[str, Any]]:
     """Optional authentication - returns user if authenticated, None otherwise"""
     if not token:

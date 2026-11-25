@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>{{ user_name }}</title></head>
+<body style="font-family: sans-serif; max-width: 600px; margin: 0 auto; padding: 20px;">
+  <h2>Hi {{ user_name }},</h2>
+
+  {% if otp %}
+  <p>Your verification code is:</p>
+  <div style="font-size: 32px; font-weight: bold; letter-spacing: 4px;
+              background: #f4f4f4; padding: 16px; text-align: center;
+              border-radius: 8px; margin: 20px 0;">
+    {{ otp }}
+  </div>
+  <p>This code expires in {{ ttl_minutes }} minutes.</p>
+  {% endif %}
+
+  {% if message %}
+  <p>{{ message }}</p>
+  {% endif %}
+
+  <p style="color: #888; font-size: 13px;">
+    If you didn't request this, ignore this email.
+  </p>
+</body>
+</html>

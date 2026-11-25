@@ -1,3 +1,4 @@
+from App.services.llm_service import LlmService, get_llm_service, llm_service
 from App.repository.llmRepository import llmChatRepo
 from App.core.orchestrator import ChatOrchestrator, detect_upload_kind
 from App.api.dependencies.auth import decode_jwt
@@ -56,9 +57,9 @@ _repo = llmChatRepo(
     available_ram=settings.LLM_MIN_AVAILABLE_RAM_MB
 )
 
-def get_repo() -> llmChatRepo:
-    """Dependency to get the repository instance."""
-    return _repo
+def get_repo() -> LlmService:
+    """Dependency to get the LLM Service instance."""
+    return llm_service
 
 _orchestrator = ChatOrchestrator(llm=_repo)
 
@@ -116,10 +117,21 @@ def _inject_tools_into_messages(
     if not tools or tool_choice == "none":
         return messages
     tool_defs = json.dumps(tools, indent=2)
+    forced_hint = ""
+    if tool_choice == "required":
+        forced_hint = "You MUST call one of the available tools and output ONLY the JSON object.\n"
+    elif isinstance(tool_choice, dict):
+        fn_name = (tool_choice.get("function") or {}).get("name") or tool_choice.get("name")
+        if fn_name:
+            forced_hint = f"You MUST call the tool '{fn_name}' and output ONLY the JSON object.\n"
+
     tool_instruction = (
-        "You have access to the following tools/functions. "
-        "If you decide to call a tool, respond ONLY with a JSON object in this exact format:\n"
-        '{"name": "<tool_name>", "arguments": {<args>}}\n\n'
+        "[TOOL CALLING INSTRUCTIONS]:\n"
+        "You have access to external tools/functions listed below. "
+        "Whenever a tool can fulfill the user's request (such as fetching live data, weather, calculations, or actions), "
+        "do NOT guess or fabricate the answer in prose — respond ONLY with a raw JSON object in this exact format:\n"
+        '{"name": "<tool_name>", "arguments": {<key>: <value>}}\n'
+        f"{forced_hint}\n"
         f"Available tools:\n{tool_defs}"
     )
     out = [dict(m) for m in messages]
@@ -131,30 +143,53 @@ def _inject_tools_into_messages(
 
 
 def _extract_tool_calls(content: str, tools: list[dict] | None) -> list[dict] | None:
-    """Parse JSON tool call output into OpenAI `tool_calls` format when valid."""
+    """Parse JSON tool call output (even if wrapped in markdown fences, <tool_call> tags, or brief prose) into OpenAI `tool_calls` format."""
     if not tools or not content:
         return None
     tool_names = {
         (t.get("function", {}) if isinstance(t, dict) else {}).get("name") or t.get("name")
         for t in tools
+        if isinstance(t, dict)
     }
-    text = content.strip()
-    if text.startswith("```"):
-        text = text.strip("`").lstrip("json").strip()
-    try:
-        obj = json.loads(text)
-    except Exception:
+    tool_names.discard(None)
+    if not tool_names:
         return None
-    if isinstance(obj, dict) and obj.get("name") in tool_names:
-        args = obj.get("arguments", obj.get("parameters", {}))
-        return [{
-            "id": f"call_{uuid4().hex[:12]}",
-            "type": "function",
-            "function": {
-                "name": obj["name"],
-                "arguments": args if isinstance(args, str) else json.dumps(args),
-            },
-        }]
+
+    candidates: list[str] = [content.strip()]
+    import re as _re
+    for m in _re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", content, flags=_re.DOTALL | _re.IGNORECASE):
+        candidates.append(m.group(1).strip())
+    for m in _re.finditer(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", content, flags=_re.DOTALL | _re.IGNORECASE):
+        candidates.append(m.group(1).strip())
+
+    decoder = json.JSONDecoder()
+    for idx_pos, ch in enumerate(content):
+        if ch == "{":
+            try:
+                parsed_obj, _ = decoder.raw_decode(content[idx_pos:])
+                if isinstance(parsed_obj, dict):
+                    candidates.append(json.dumps(parsed_obj))
+            except Exception:
+                continue
+
+    for cand in candidates:
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            fn_block = obj.get("function") if isinstance(obj.get("function"), dict) else obj
+            name = fn_block.get("name")
+            if name in tool_names:
+                args = fn_block.get("arguments", fn_block.get("parameters", {}))
+                return [{
+                    "id": f"call_{uuid4().hex[:12]}",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": args if isinstance(args, str) else json.dumps(args),
+                    },
+                }]
     return None
 
 
@@ -237,10 +272,10 @@ def _parse_system_prompts_chain(system_prompts_raw: str | None) -> list[dict[str
     return chain
 
 
-async def _require_loaded_model(repo: llmChatRepo, requested_model: str | None = None) -> str:
+async def _require_loaded_model(service: LlmService, requested_model: str | None = None) -> str:
     """Ensure a model is already loaded (never auto-load on chat/vision endpoints)."""
-    is_ready = await repo.is_ready()
-    loaded_models = await repo.get_loaded_models_list()
+    is_ready = await service.is_ready()
+    loaded_models = await service.get_loaded_models_list()
     if not is_ready or not loaded_models:
         raise ModelNotLoadedError("No model is currently loaded. Please load a model first via POST /app/v1/load_model.")
     active = loaded_models[0]
@@ -270,7 +305,7 @@ async def completion(
         default=None,
         description="Optional file or image upload (auto-detects Images, PDF, Scanned PDF, DOCX, XLSX, CSV, ZIP, JSON, TXT, Code strictly in RAM)",
     ),
-    repo: llmChatRepo = Depends(get_repo),
+    service: LlmService = Depends(get_repo),
 ):
     uploaded_bytes: bytes | None = None
     uploaded_filename: str | None = None
@@ -292,7 +327,7 @@ async def completion(
                 raise FileTooLargeError("Uploaded file exceeds 15MB limit")
             uploaded_kind, _ = detect_upload_kind(uploaded_bytes, uploaded_filename)
 
-    active_model = await _require_loaded_model(repo, request.model)
+    active_model = await _require_loaded_model(service, request.model)
     request.model = active_model
     tenant_user_id, tenant_session_id = _resolve_tenant(
         req,
@@ -327,13 +362,18 @@ async def completion(
         or uploaded_bytes is not None
         or getattr(request, "image_base64", None) is not None
     )
+    effective_force_web = getattr(request, "use_web", None)
+    if effective_force_web is None and request.tools and request.tool_choice != "none":
+        # Do not pre-empt explicit external function-calling tools with background web scraping unless use_web=True
+        effective_force_web = False
+
     if should_orchestrate:
         orch_ctx = await _orchestrator.prepare_context(
             request.messages,
             file_bytes=uploaded_bytes,
             filename=uploaded_filename,
             image_base64=getattr(request, "image_base64", None),
-            force_web=getattr(request, "use_web", None),
+            force_web=effective_force_web,
             force_rag=getattr(request, "use_rag", None),
             user_id=tenant_user_id,
             session_id=tenant_session_id,
@@ -369,7 +409,7 @@ async def completion(
         raw_messages = [{"role": "user", "content": "Hello"}]
 
     raw_messages = _inject_tools_into_messages(raw_messages, request.tools, request.tool_choice)
-    prompt = await repo.format_messages_native(raw_messages, tools=request.tools)
+    prompt = await service.format_messages_native(raw_messages, tools=request.tools)
 
     logger.info(f"📝 Prompt: {len(prompt)} chars")
     logger.info(f"📄 Preview: {prompt[:150]}...")
@@ -424,24 +464,24 @@ async def completion(
             yield chunk({"role": "assistant"})
             try:
                 async with _orchestrator.vram_gate:
-                    async for token in repo.stream_llm(prompt, chat_id=stream_task_id, **gen_kwargs):
+                    async for token in service.stream_llm(prompt, chat_id=stream_task_id, **gen_kwargs):
                         if await req.is_disconnected():
                             logger.info(f"Client disconnected mid-stream; cancelling {stream_task_id}")
-                            await repo.cancel_request(stream_task_id)
+                            await service.cancel_request(stream_task_id)
                             return
                         collected.append(token)
                         yield chunk({"content": token})
                 completed_normally = True
                 yield chunk({}, finish_reason="stop")
                 if include_usage:
-                    yield chunk({}, finish_reason=None, usage=repo.pop_last_usage(stream_task_id))
+                    yield chunk({}, finish_reason=None, usage=service.pop_last_usage(stream_task_id))
                 else:
-                    repo.pop_last_usage(stream_task_id)
+                    service.pop_last_usage(stream_task_id)
                 yield "data: [DONE]\n\n"
             finally:
                 if not completed_normally:
-                    await repo.cancel_request(stream_task_id)
-                    repo.pop_last_usage(stream_task_id)
+                    await service.cancel_request(stream_task_id)
+                    service.pop_last_usage(stream_task_id)
 
             if orch_ctx is not None:
                 await _orchestrator.memory.record_chat_turn(
@@ -463,7 +503,7 @@ async def completion(
         )
 
     async with _orchestrator.vram_gate:
-        ai_msg = await repo.chat_with_metadata(
+        ai_msg = await service.chat_with_metadata(
             prompt=prompt,
             **gen_kwargs
         )
@@ -500,9 +540,9 @@ async def completion(
             {"role": "assistant", "content": content},
             {"role": "user", "content": f"<tool_output name='{t_name}'>\n{tool_output}\n</tool_output>\nNow answer the user's question directly using this tool output."},
         ]
-        followup_prompt = await repo.format_messages_native(followup_msgs)
+        followup_prompt = await service.format_messages_native(followup_msgs)
         async with _orchestrator.vram_gate:
-            ai_msg2 = await repo.chat_with_metadata(prompt=followup_prompt, **gen_kwargs)
+            ai_msg2 = await service.chat_with_metadata(prompt=followup_prompt, **gen_kwargs)
         content = ai_msg2.content if hasattr(ai_msg2, "content") else str(ai_msg2)
         meta2 = getattr(ai_msg2, "response_metadata", {}) or {}
         u2 = meta2.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
@@ -550,17 +590,17 @@ async def completion(
 
 
 # @llmRouter.post("/chat/completions")
-# async def completion(request: ChatRequest, req: Request, repo: llmChatRepo = Depends(get_repo)):
+# async def completion(request: ChatRequest, req: Request, service: LlmService = Depends(get_repo)):
 #     try:
 #         logger.info(f"Chat request - Model: {request.model}, Messages: {len(request.messages)}")
         
 #         # ============================================
 #         # 1. CHECK IF REPOSITORY IS READY
 #         # ============================================
-#         if not await repo.is_ready():
+#         if not await service.is_ready():
 #             logger.warning("Repository not ready - attempting to initialize...")
 #             try:
-#                 await repo.initialize(model_name=request.model)
+#                 await service.initialize(model_name=request.model)
 #                 logger.info(f"Repository initialized with model: {request.model}")
 #             except Exception as e:
 #                 logger.error(f"Failed to initialize repository: {e}")
@@ -620,7 +660,7 @@ async def completion(
 #         if hasattr(request, 'stop') and request.stop is not None:
 #             gen_kwargs["stop"] = request.stop
         
-#         response = await repo.chat(
+#         response = await service.chat(
 #             prompt=prompt,
 #             **gen_kwargs
 #         )
@@ -664,13 +704,13 @@ async def completion(
 # ============================================
 
 @llmRouter.post("/load_model")
-async def load_model(model_name: str, repo: llmChatRepo = Depends(get_repo)):
+async def load_model(model_name: str, service: LlmService = Depends(get_repo)):
     """
     Load a specific model into the repository.
     If the model is already loaded, just return a message saying so.
     """
-    is_ready = await repo.is_ready()
-    loaded_models = await repo.get_loaded_models_list()
+    is_ready = await service.is_ready()
+    loaded_models = await service.get_loaded_models_list()
 
     if is_ready and model_name in loaded_models:
         logger.info(f"Model '{model_name}' is already loaded")
@@ -685,18 +725,18 @@ async def load_model(model_name: str, repo: llmChatRepo = Depends(get_repo)):
     if is_ready and loaded_models:
         current_model = loaded_models[0]
         logger.info(f"Unloading current model '{current_model}' to load '{model_name}'")
-        await repo.shutdown()
+        await service.shutdown()
         logger.info(f"Model '{current_model}' unloaded successfully")
 
     logger.info(f"Loading model '{model_name}'...")
-    await repo.initialize(model_name=model_name)
+    await service.initialize(model_name=model_name)
 
     return {
         "status": "success",
         "message": f"Model '{model_name}' loaded successfully",
         "model": model_name,
-        "ready": await repo.is_ready(),
-        "loaded_models": await repo.get_loaded_models_list(),
+        "ready": await service.is_ready(),
+        "loaded_models": await service.get_loaded_models_list(),
     }
 
 
@@ -705,13 +745,13 @@ async def load_model(model_name: str, repo: llmChatRepo = Depends(get_repo)):
 # ============================================
 
 @llmRouter.post("/unload_model")
-async def unload_model(repo: llmChatRepo = Depends(get_repo)):
+async def unload_model(service: LlmService = Depends(get_repo)):
     """
     Unload the currently loaded model.
     If no model is loaded, just return a message saying so.
     """
-    is_ready = await repo.is_ready()
-    loaded_models = await repo.get_loaded_models_list()
+    is_ready = await service.is_ready()
+    loaded_models = await service.get_loaded_models_list()
 
     if not is_ready or not loaded_models:
         logger.info("No model is currently loaded")
@@ -724,15 +764,15 @@ async def unload_model(repo: llmChatRepo = Depends(get_repo)):
 
     current_model = loaded_models[0]
     logger.info(f"Unloading model '{current_model}'...")
-    await repo.shutdown()
+    await service.shutdown()
     logger.info(f"Model '{current_model}' unloaded successfully")
 
     return {
         "status": "success",
         "message": f"✅ Model '{current_model}' unloaded successfully",
         "unloaded_model": current_model,
-        "ready": await repo.is_ready(),
-        "loaded_models": await repo.get_loaded_models_list(),
+        "ready": await service.is_ready(),
+        "loaded_models": await service.get_loaded_models_list(),
     }
 
 
@@ -741,10 +781,10 @@ async def unload_model(repo: llmChatRepo = Depends(get_repo)):
 # ============================================
 
 @llmRouter.get("/health")
-async def health_check(repo: llmChatRepo = Depends(get_repo)):
+async def health_check(service: LlmService = Depends(get_repo)):
     """Check if the LLM service is ready."""
-    is_ready = await repo.is_ready()
-    loaded_models = await repo.get_loaded_models_list()
+    is_ready = await service.is_ready()
+    loaded_models = await service.get_loaded_models_list()
     return {
         "status": "healthy" if is_ready else "unhealthy",
         "ready": is_ready,
@@ -759,9 +799,9 @@ async def health_check(repo: llmChatRepo = Depends(get_repo)):
 # ============================================
 
 @llmRouter.get("/models")
-async def get_dir_models(repo: llmChatRepo = Depends(get_repo)):
+async def get_dir_models(service: LlmService = Depends(get_repo)):
     """Get list of available models from the directory."""
-    models = await repo.get_models_cdir()
+    models = await service.get_models_cdir()
     return {
         "object": "list",
         "data": [
@@ -782,10 +822,10 @@ async def get_dir_models(repo: llmChatRepo = Depends(get_repo)):
 # ============================================
 
 @llmRouter.get("/active_model")
-async def get_active_model(repo: llmChatRepo = Depends(get_repo)):
+async def get_active_model(service: LlmService = Depends(get_repo)):
     """View the currently active/loaded model and runtime hardware configuration."""
-    is_ready = await repo.is_ready()
-    loaded_models = await repo.get_loaded_models_list()
+    is_ready = await service.is_ready()
+    loaded_models = await service.get_loaded_models_list()
     return {
         "ready": is_ready,
         "active_model": loaded_models[0] if loaded_models else None,
@@ -793,11 +833,11 @@ async def get_active_model(repo: llmChatRepo = Depends(get_repo)):
         "orchestrator_enabled": settings.ORCH_ENABLED,
         "vision_model": settings.ORCH_VISION_MODEL,
         "config": {
-            "n_ctx": repo.n_ctx,
-            "n_gpu_layers": repo.n_gpu_layers,
-            "n_batch": repo.n_batch,
-            "n_threads": repo.n_threads,
-            "continuous_batch_slots": repo.continuous_batch_slots,
+            "n_ctx": service.n_ctx,
+            "n_gpu_layers": service.n_gpu_layers,
+            "n_batch": service.n_batch,
+            "n_threads": service.n_threads,
+            "continuous_batch_slots": service.continuous_batch_slots,
         },
     }
 
@@ -969,13 +1009,15 @@ async def chat_with_uploaded_image(
     session_id: str | None = Form(default=None),
     use_web: bool | None = Form(default=None),
     use_rag: bool | None = Form(default=None),
+    tools: str | None = Form(default=None, description="Optional JSON array of OpenAI tool definitions"),
+    tool_choice: str | None = Form(default=None, description="Optional tool_choice ('auto', 'none', 'required')"),
     temperature: float | None = Form(default=None),
     max_tokens: int | None = Form(default=None),
-    repo: llmChatRepo = Depends(get_repo),
+    service: LlmService = Depends(get_repo),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
     """Chat with optional uploaded file/image + chained JSON list of system prompts + main user prompt (strictly isolated by user_id & session_id)."""
-    active_model = await _require_loaded_model(repo, model)
+    active_model = await _require_loaded_model(service, model)
     uid, sid = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
 
     uploaded_bytes: bytes | None = None
@@ -999,21 +1041,37 @@ async def chat_with_uploaded_image(
         messages_chain.append({"role": "system", "content": combined_sys})
     messages_chain.append({"role": "user", "content": prompt})
 
+    parsed_tools: list[dict] | None = None
+    if tools and tools.strip() and tools.strip() not in ("string", "null", "None"):
+        try:
+            t_loaded = json.loads(tools)
+            if isinstance(t_loaded, dict):
+                t_loaded = [t_loaded]
+            if isinstance(t_loaded, list) and t_loaded != [{"additionalProp1": {}}]:
+                parsed_tools = t_loaded
+        except Exception:
+            parsed_tools = None
+    clean_tool_choice = tool_choice.strip() if (tool_choice and tool_choice.strip() not in ("", "string", "null", "None")) else None
+    effective_use_web = False if (use_web is None and parsed_tools and clean_tool_choice != "none") else use_web
+
     orch_ctx = await orch.prepare_context(
         messages_chain,
         file_bytes=uploaded_bytes,
         filename=uploaded_filename,
-        force_web=use_web,
+        force_web=effective_use_web,
         force_rag=use_rag,
         user_id=uid,
         session_id=sid,
         model_name=active_model,
     )
-    formatted_prompt = await repo.format_messages_native(orch_ctx.enriched_messages)
+    final_msgs = _inject_tools_into_messages(orch_ctx.enriched_messages, parsed_tools, clean_tool_choice)
+    formatted_prompt = await service.format_messages_native(final_msgs, tools=parsed_tools)
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
     async with orch.vram_gate:
-        response = await repo.chat(prompt=formatted_prompt, **gen_kwargs)
+        response = await service.chat(prompt=formatted_prompt, **gen_kwargs)
     content = response if isinstance(response, str) else str(response)
+    extracted_calls = _extract_tool_calls(content, parsed_tools)
+    finish_reason = "tool_calls" if extracted_calls else "stop"
 
     await orch.memory.record_chat_turn(
         query=orch_ctx.user_query,
@@ -1023,6 +1081,9 @@ async def chat_with_uploaded_image(
         user_id=uid,
         session_id=sid,
     )
+    msg_out: dict[str, Any] = {"role": "assistant", "content": None if extracted_calls else content}
+    if extracted_calls:
+        msg_out["tool_calls"] = extracted_calls
     return {
         "id": f"chatcmpl-{uuid4().hex[:8]}",
         "object": "chat.completion",
@@ -1031,7 +1092,7 @@ async def chat_with_uploaded_image(
         "user_id": uid,
         "session_id": sid,
         "system_prompts_count": len(sys_chain),
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": msg_out, "finish_reason": finish_reason}],
         "vision_report": orch_ctx.vision_report.model_dump() if orch_ctx.vision_report else None,
         "document_report": (
             orch_ctx.document_report.model_dump(exclude={"full_text", "pages"})
@@ -1062,7 +1123,7 @@ async def chat_with_uploaded_code(
     use_rag: bool | None = Form(default=True),
     temperature: float | None = Form(default=0.2),
     max_tokens: int | None = Form(default=1024),
-    repo: llmChatRepo = Depends(get_repo),
+    service: LlmService = Depends(get_repo),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
     """
@@ -1073,7 +1134,7 @@ async def chat_with_uploaded_code(
     """
     from App.core.orchestrator import UniversalCodeASTProcessor, ParsedPage, ParsedDocumentReport
 
-    active_model = await _require_loaded_model(repo, model)
+    active_model = await _require_loaded_model(service, model)
     uid, sid = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
 
     t0 = time.perf_counter()
@@ -1083,7 +1144,7 @@ async def chat_with_uploaded_code(
     is_image_code = False
 
     # Calculate safe token-saving character budget based on active model's per-sequence KV context window
-    per_seq_ctx = max(512, repo.n_ctx // max(1, repo.continuous_batch_slots))
+    per_seq_ctx = max(512, service.n_ctx // max(1, service.continuous_batch_slots))
     reserve_gen = min(int(max_tokens or 1024), max(256, per_seq_ctx // 3))
     max_code_chars = max(1400, (per_seq_ctx - reserve_gen - 450) * 3)
 
@@ -1185,10 +1246,10 @@ async def chat_with_uploaded_code(
         session_id=sid,
         model_name=active_model,
     )
-    formatted_prompt = await repo.format_messages_native(orch_ctx.enriched_messages)
+    formatted_prompt = await service.format_messages_native(orch_ctx.enriched_messages)
     gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
     async with orch.vram_gate:
-        ai_msg = await repo.chat_with_metadata(prompt=formatted_prompt, **gen_kwargs)
+        ai_msg = await service.chat_with_metadata(prompt=formatted_prompt, **gen_kwargs)
 
     content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
     meta = getattr(ai_msg, "response_metadata", {}) or {}

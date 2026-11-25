@@ -1,7 +1,7 @@
 # settings.py - SQLite version (configured from .env)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import SecretStr, Field, field_validator
-from typing import Any
+from typing import Any, Optional
 import os
 
 
@@ -262,6 +262,108 @@ class Settings(BaseSettings):
     ALLOWED_ORIGINS: str = Field(
         default="*",
         description="Allowed CORS origins (comma-separated)"
+    )
+    
+    REDIS_URL: str = Field(
+        default="redis://127.0.0.1:6379/0",
+        description="Redis connection URL"
+    )
+
+    MAX_BODY_SIZE: int = Field(
+        default=50 * 1024 * 1024,
+        description="Maximum request body size in bytes (50MB default for LLM uploads)"
+    )
+    MAX_DECOMPRESSED_BODY_SIZE: int = Field(
+        default=100 * 1024 * 1024,
+        description="Maximum decompressed body size in bytes"
+    )
+    KILL_SWITCH_ENABLED: bool = Field(
+        default=False,
+        description="Global API kill switch"
+    )
+    TRUSTED_PROXIES: str = Field(
+        default="",
+        description="Comma separated list of trusted reverse proxy IPs/CIDRs"
+    )
+
+    EMAIL_ENABLED: bool = Field(
+        default=False,
+        description="Enable/disable email sending globally"
+    )
+    EMAIL_SMTP_HOST: str = Field(
+        default="localhost",
+        description="SMTP server hostname"
+    )
+    EMAIL_SMTP_PORT: int = Field(
+        default=1025,
+        description="SMTP server port (587 for TLS, 465 for SSL, 1025 for Mailpit)"
+    )
+    EMAIL_SMTP_USERNAME: str = Field(
+        default="",
+        description="SMTP username (empty for local Mailpit)"
+    )
+    EMAIL_SMTP_PASSWORD: SecretStr = Field(
+        default=SecretStr(""),
+        description="SMTP password (app password for Gmail)"
+    )
+    EMAIL_FROM: str = Field(
+        default="noreply@example.com",
+        description="From email address"
+    )
+    EMAIL_FROM_NAME: str = Field(
+        default="API Boilerplate",
+        description="From display name"
+    )
+    EMAIL_USE_TLS: bool = Field(
+        default=False,
+        description="Use TLS (True for port 587, False for 1025/465)"
+    )
+    EMAIL_USE_SSL: bool = Field(
+        default=False,
+        description="Use SSL (True for port 465, False for 587/1025)"
+    )
+    EMAIL_TIMEOUT: int = Field(
+        default=15,
+        ge=5,
+        le=60,
+        description="SMTP timeout in seconds"
+    )
+    EMAIL_OTP_TTL_SECONDS: int = Field(
+        default=300,
+        ge=60,
+        le=900,
+        description="OTP validity in seconds (default 5 min)"
+    )
+    EMAIL_OTP_MAX_ATTEMPTS: int = Field(
+        default=5,
+        ge=1,
+        le=10,
+        description="Max OTP verification attempts"
+    )
+    EMAIL_CA_BUNDLE: Optional[str] = Field(
+    default="",
+    description="Path to custom root CA bundle for SMTP TLS verification"
+    )
+    LISTEN_IP:Optional[str]=Field("0.0.0.0")
+    PORT:int=Field(8002)
+    AUTO_RELOAD:bool=Field(False)
+    WORKER:int=Field(3)
+#### MFA 
+    ENABLE_MFA: bool = Field(
+        default=False,
+        description="Enable MFA login"
+    )
+    MFA_CHALLENGE_TTL_SECONDS: int = Field(
+        default=300, ge=60, le=900,
+        description="MFA challenge token TTL in seconds"
+    )
+    MFA_MAX_ATTEMPTS: int = Field(
+        default=5, ge=1, le=10,
+        description="Max code attempts per challenge"
+    )
+    MFA_ISSUER_NAME: str = Field(
+        default="API Boilerplate",
+        description="Issuer name shown in authenticator apps"
     )
     
     @field_validator('RATE_LIMIT_DEFAULT', mode='before')
