@@ -19,8 +19,21 @@ class LoginRequest(BaseModel):
 class LoginResponse(BaseModel):
     """Login response model"""
     access_token: str
+    refresh_token: Optional[str] = None
+    expires_in: Optional[int] = None
     token_type: str = "bearer"
     user: "UserData"
+
+
+class RefreshTokenRequest(BaseModel):
+    """Optional JSON body for refresh token (also reads HttpOnly refresh_token cookie)"""
+    refresh_token: Optional[str] = None
+
+
+class LogoutRequest(BaseModel):
+    """Optional JSON body for logout (also reads HttpOnly CSO & refresh_token cookies)"""
+    refresh_token: Optional[str] = None
+    logout_everywhere: bool = Field(default=False, description="Revoke all sessions across all devices")
 
 
 # ==================== SIGNUP MODELS ====================

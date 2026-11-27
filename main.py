@@ -310,45 +310,6 @@ async def value_error_handler(request: Request, exc: ValueError):
         content={"error": "VALIDATION_ERROR", "detail": str(exc)},
     )
 
-@app.middleware("http")
-async def kill_switch_middleware(request: Request, call_next):
-    """Global middleware for emergency kill switch (Maintenance Mode)"""
-    # Whitelist System and Documentation endpoints (including offline Swagger /assets)
-    path = request.url.path
-    is_whitelisted = (
-        path == "/health"
-        or path == "/reset-kill-switch"
-        or path.startswith("/docs")
-        or path.startswith("/redoc")
-        or path.startswith("/openapi.json")
-        or path.startswith("/assets")
-    )
-    
-    # Check both manual and automatic kill switches
-    is_killed = settings.KILL_SWITCH_ENABLED or getattr(app.state, "auto_kill_enabled", False)
-    
-    if is_killed and not is_whitelisted:
-        return JSONResponse(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={
-                "detail": "Service is temporarily unavailable due to maintenance.",
-                "type": "auto_kill" if getattr(app.state, "auto_kill_enabled", False) else "manual_kill"
-            }
-        )
-    
-    try:
-        response = await call_next(request)
-        return response
-    except (AppError, HTTPException, RequestValidationError, asyncio.QueueFull, ValueError, FileNotFoundError, MemoryError):
-        raise
-    except Exception as e:
-        logger.error(f"CRITICAL: Unhandled exception detected. Triggering AUTO-KILL. Error: {e}")
-        app.state.auto_kill_enabled = True
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": "An internal error occurred. System has entered safety mode."}
-        )
-
 # Add Middlewares (Order: Outermost -> Innermost)
 # Middleware Stack -- order matters (last added = outermost)
 # ============================================================================

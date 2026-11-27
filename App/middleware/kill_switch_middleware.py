@@ -84,7 +84,7 @@ class KillSwitchMiddleware(BaseHTTPMiddleware):
     TTL expires, traffic resumes automatically.
     """
 
-    WHITELIST = ("/health", "/docs", "/redoc", "/openapi.json")
+    WHITELIST = ("/health", "/reset-kill-switch", "/docs", "/redoc", "/openapi.json", "/assets")
 
     def __init__(self, app, recovery_seconds: int = 60):
         super().__init__(app)

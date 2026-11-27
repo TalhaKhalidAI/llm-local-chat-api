@@ -20,6 +20,7 @@ EXCLUDED_MEDIA_TYPES = {
     "application/x-gzip",
     "application/octet-stream",
     "application/pdf",
+    "text/event-stream",
 }
 
 

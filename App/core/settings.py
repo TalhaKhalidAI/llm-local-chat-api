@@ -165,8 +165,8 @@ class Settings(BaseSettings):
     
     # LLM Default Generation / Sampling Fallbacks (Inference runtime)
     DEFAULT_TEMPERATURE: float = Field(
-        default=0.7,
-        description="Default sampling temperature"
+        default=0.3,
+        description="Default sampling temperature (lower values reduce hallucination in RAG/factual chat)"
     )
     
     DEFAULT_TOP_P: float = Field(
@@ -366,6 +366,19 @@ class Settings(BaseSettings):
         description="Issuer name shown in authenticator apps"
     )
     
+    COOKIE_SECURE: bool = Field(
+        default=False,
+        description="Set Secure flag on auth cookies (True in HTTPS production)"
+    )
+    REFRESH_TOKEN_TTL_SECONDS: int = Field(
+        default=7 * 24 * 3600,
+        description="Refresh token TTL in seconds (default 7 days)"
+    )
+    SLT_TOKEN_EXPIRE_MINUTES: int = Field(
+        default=10,
+        description="Short-lived temporary token expiration in minutes"
+    )
+
     @field_validator('RATE_LIMIT_DEFAULT', mode='before')
     @classmethod
     def validate_rate_limit(cls, v: Any) -> Any:

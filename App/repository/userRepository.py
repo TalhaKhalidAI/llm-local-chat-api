@@ -140,3 +140,39 @@ class UserRepository:
     async def reset_password(self, user_id: int, new_password_hash: str) -> bool:
         """Reset password hash"""
         return await self.change_password(user_id, new_password_hash)
+
+    async def get_by_ids(self, user_ids: List[int]) -> List[User]:
+        """Get multiple active users by IDs"""
+        if not user_ids:
+            return []
+        stmt = select(User).where(and_(User.id.in_(user_ids), User.is_deleted == False))
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+
+    async def update_permissions(self, user_id: int, permissions: Dict[str, bool]) -> Optional[User]:
+        """Persist updated permissions dict for user"""
+        db_user = await self.get_by_id(user_id)
+        if not db_user:
+            return None
+        db_user.permissions = dict(permissions)
+        await self.db.flush()
+        await self.db.refresh(db_user)
+        return db_user
+
+    async def update_mfa(
+        self,
+        user_id: int,
+        mfa_enabled: bool,
+        mfa_secret: Optional[str] = None,
+        mfa_method: str = "totp",
+    ) -> Optional[User]:
+        """Persist MFA configuration fields"""
+        db_user = await self.get_by_id(user_id)
+        if not db_user:
+            return None
+        db_user.mfa_enabled = mfa_enabled
+        db_user.mfa_secret = mfa_secret
+        db_user.mfa_method = mfa_method
+        await self.db.flush()
+        await self.db.refresh(db_user)
+        return db_user

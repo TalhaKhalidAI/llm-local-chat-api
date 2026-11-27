@@ -1,7 +1,11 @@
 from typing import Any
 from App.services.llm_service import LlmService, get_llm_service, llm_service
 from App.repository.llmRepository import llmChatRepo
-from App.core.orchestrator import ChatOrchestrator, detect_upload_kind
+from App.core.orchestrator import (
+    ChatOrchestrator,
+    detect_upload_kind,
+    strip_ungrounded_citations,
+)
 from App.api.dependencies.auth import decode_jwt
 from App.core.exceptions import (
     FileTooLargeError,
@@ -16,7 +20,7 @@ from App.core.exceptions import (
     VisionModelNotLoadedError,
 )
 from fastapi import APIRouter, Request, Depends, Query, File, Form, UploadFile
-from App.models.llmModels import ChatChoice, ChatMessage, ChatRequest, ChatResponse
+from App.models.L import ChatChoice, ChatMessage, ChatRequest, ChatResponse
 from App.core.settings import settings
 from fastapi.responses import StreamingResponse
 from uuid import uuid4
@@ -43,26 +47,16 @@ text_splitter = RecursiveCharacterTextSplitter(
     length_function=len,
 )
 # ============================================
-# Repository Instance
+# Repository / Service / Orchestrator Singletons
 # ============================================
-_repo = llmChatRepo(
-    model_path=settings.LLM_MODEL_PATH,
-    n_gpu_layers=settings.LLM_N_GPU_LAYERS,
-    n_ctx=settings.LLM_N_CTX,
-    n_batch=settings.LLM_N_BATCH,
-    n_threads=settings.LLM_N_THREADS,
-    verbose=settings.LLM_VERBOSE,
-    use_mmap=settings.USE_MMAP,
-    use_mlock=settings.USE_MLOCK,
-    continuous_batch_slots=settings.LLM_CONTINUOUS_BATCH_SLOTS,
-    available_ram=settings.LLM_MIN_AVAILABLE_RAM_MB
-)
+# Share the exact same underlying llm_repo engine across LlmService, ChatOrchestrator, and VisionDescriberTool
+_repo = llm_service.repo
 
 def get_repo() -> LlmService:
     """Dependency to get the LLM Service instance."""
     return llm_service
 
-_orchestrator = ChatOrchestrator(llm=_repo)
+_orchestrator = ChatOrchestrator(llm=llm_service.repo)
 
 def get_orchestrator() -> ChatOrchestrator:
     """Dependency to get the orchestrator instance."""
@@ -298,11 +292,21 @@ def _require_loaded_vision_model(orch: ChatOrchestrator) -> None:
         )
 
 
+_WEATHER_INTENT_RE = None
+
+
+def _has_weather_intent(text: str) -> bool:
+    import re as _re
+    return bool(_re.search(r"\b(weather|temperature|forecast|humidity|rain|snow|wind|celsius|fahrenheit|climate|mausam)\b", text or "", _re.IGNORECASE))
+
+
 def _merge_agentic_and_client_tools(
     orch: ChatOrchestrator,
     client_tools: list[dict] | None,
     allow_web: bool = True,
     allow_rag: bool = True,
+    has_local_images: bool = False,
+    allow_weather: bool = False,
 ) -> list[dict]:
     """Combine built-in orchestrator agentic tools with any external client-supplied OpenAI tools without duplicates."""
     vision_ok = orch.vision_tool.is_loaded() or bool((settings.VISION_API_URL or "").strip())
@@ -310,6 +314,8 @@ def _merge_agentic_and_client_tools(
         has_local_docs=allow_rag,
         allow_web=allow_web,
         allow_vision=vision_ok,
+        has_local_images=has_local_images,
+        allow_weather=allow_weather,
     )
     if not client_tools:
         return internal
@@ -326,20 +332,38 @@ def _merge_agentic_and_client_tools(
 
 
 def _map_compact_react_arg(tool_name: str, raw_arg: str) -> dict[str, Any]:
-    """Convert compact GBNF ReAct `query_or_arg` string into structured tool arguments."""
+    """Convert compact GBNF ReAct `query_or_arg` string into structured tool arguments (unwrapping nested JSON if needed)."""
     import re as _re
     arg = (raw_arg or "").strip()
+    # Unwrap accidental JSON object strings emitted by small models, e.g. '{"location": "London"}'
+    if arg.startswith("{") and arg.endswith("}"):
+        try:
+            parsed = json.loads(arg)
+            if isinstance(parsed, dict) and parsed:
+                for k in ("url", "location", "city", "query", "filter", "arg"):
+                    if k in parsed and isinstance(parsed[k], str) and parsed[k].strip():
+                        arg = parsed[k].strip()
+                        break
+                else:
+                    first_str = next((str(v).strip() for v in parsed.values() if isinstance(v, (str, int, float))), "")
+                    if first_str:
+                        arg = first_str
+        except Exception:
+            pass
     if tool_name == "search_document":
         return {"query": arg or "overview", "top_k": 3}
     if tool_name == "search_images":
         return {"query": arg or "image"}
     if tool_name == "get_weather":
-        clean_city = _re.sub(r"^(?:weather\s+(?:in|for|at)\s+|live\s+weather\s+(?:in|for)\s+)", "", arg, flags=_re.IGNORECASE).strip(" ?!.,")
+        clean_city = _re.sub(r"^(?:weather\s+(?:in|for|at)\s+|live\s+weather\s+(?:in|for)\s+)", "", arg, flags=_re.IGNORECASE).strip(" ?!.,'\"")
         return {"location": clean_city or arg}
     if tool_name == "web_search":
         return {"query": arg}
+    if tool_name == "research_person":
+        return {"query": arg}
     if tool_name == "scrape_website":
-        return {"url": arg}
+        m_u = _re.search(r"https?://[^\s<>'\"\)\]]+", arg)
+        return {"url": m_u.group(0).rstrip(".,;:") if m_u else arg}
     if tool_name == "query_table_data":
         return {"filter": arg}
     if tool_name == "read_document_pages":
@@ -437,38 +461,86 @@ async def _execute_hybrid_react_loop(
     # =========================================================================
     # PATH B: True Multi-Step GBNF Grammar-Constrained ReAct Agent (`is_agentic=True`)
     # =========================================================================
+    import re as _re
+    from App.core.orchestrator import extract_urls_from_text
+
+    user_q = orch_ctx.user_query if orch_ctx is not None else next((m.get("content", "") for m in reversed(base_messages) if m.get("role") == "user"), "")
+
+    # Extract <conversation_memory> & remembered real URLs so the ReAct Planner is NEVER blind to prior session turns!
+    planner_memory_blocks: list[str] = []
+    remembered_urls: list[str] = []
+    for bm in base_messages:
+        c_str = str(bm.get("content") or "")
+        for mem_m in _re.finditer(r"<conversation_memory>([\s\S]*?)</conversation_memory>", c_str):
+            mem_txt = mem_m.group(1).strip()
+            if mem_txt:
+                planner_memory_blocks.append(mem_txt[:700])
+                remembered_urls.extend(extract_urls_from_text(mem_txt))
+        if bm.get("role") == "user":
+            remembered_urls.extend(extract_urls_from_text(c_str))
+    remembered_urls = [u for u in dict.fromkeys(remembered_urls) if not orch.web_tool._is_placeholder_url(u)][:5]
+
+    memory_section = ""
+    if planner_memory_blocks or remembered_urls:
+        mem_parts: list[str] = []
+        if planner_memory_blocks:
+            mem_parts.append("\n".join(planner_memory_blocks)[:1150])
+        if remembered_urls:
+            mem_parts.append("Remembered Real URLs in this session: " + ", ".join(remembered_urls))
+        memory_section = "\n\n[Session Conversation Memory]:\n" + "\n".join(mem_parts)
+
     internal_tool_names = [
         (t.get("function") or {}).get("name")
         for t in (active_tools or [])
         if isinstance(t, dict) and (t.get("function") or {}).get("name") in orch.INTERNAL_TOOL_NAMES
     ]
     if not internal_tool_names:
-        internal_tool_names = ["search_document", "read_document_pages", "query_table_data", "web_search", "get_weather", "scrape_website"]
+        internal_tool_names = ["web_search", "scrape_website", "research_person"]
+        if _has_weather_intent(user_q):
+            internal_tool_names.append("get_weather")
+    elif not _has_weather_intent(user_q) and "get_weather" in internal_tool_names:
+        # Prevent unrelated small-model weather hallucinations when user never asked about weather
+        internal_tool_names = [n for n in internal_tool_names if n != "get_weather"]
 
-    tool_catalog_lines = [
-        "- search_document: Search user's uploaded/local session documents in ChromaDB (`query_or_arg` = search keywords)",
-        "- read_document_pages: Read exact page numbers from uploaded document (`query_or_arg` = e.g. '1' or '2-4')",
-        "- query_table_data: Compute exact sum/average/filter on CSV or table columns (`query_or_arg` = column or filter)",
-        "- get_weather: Get real-time live weather for a city (`query_or_arg` = city name ONLY, e.g. 'London')",
-        "- web_search: Search live internet & news for recent facts/winners (`query_or_arg` = search query)",
-        "- scrape_website: Scrape text from a specific URL (`query_or_arg` = full https:// URL)",
-        "- search_images: Search previously uploaded/described images & OCR in this session (`query_or_arg` = visual/OCR keywords)",
-    ]
-    if "inspect_page_visual" in internal_tool_names:
-        tool_catalog_lines.append("- inspect_page_visual: OCR/vision analysis on a PDF page (`query_or_arg` = '1: question')")
+    _full_tool_catalog = {
+        "search_document": "- search_document: Search user's uploaded/local session documents in ChromaDB (`query_or_arg` = search keywords)",
+        "read_document_pages": "- read_document_pages: Read exact page numbers from uploaded document (`query_or_arg` = e.g. '1' or '2-4')",
+        "query_table_data": "- query_table_data: Compute exact sum/average/filter on CSV or table columns (`query_or_arg` = column or filter)",
+        "get_weather": "- get_weather: Get real-time live weather for a specific city (`query_or_arg` = exact city name ONLY)",
+        "web_search": "- web_search: Search live internet & news for recent facts/winners (`query_or_arg` = search query)",
+        "scrape_website": "- scrape_website: Deeply scrape a REAL public URL (GitHub profile/repo -> drills into repos, README, file tree & code; Website -> crawls relevant sub-links; `query_or_arg` = real https:// URL ONLY, NEVER invent example.com or USERNAME)",
+        "research_person": "- research_person: Multi-platform public profile search across GitHub (with repo inspection), LinkedIn public index, Indeed/career sites, and portfolios (`query_or_arg` = person name + optional handle/role)",
+        "search_images": "- search_images: Search previously uploaded/described images & OCR in this session (`query_or_arg` = visual/OCR keywords)",
+        "inspect_page_visual": "- inspect_page_visual: OCR/vision analysis on a PDF page (`query_or_arg` = '1: question')",
+    }
+    tool_catalog_lines = [_full_tool_catalog[n] for n in internal_tool_names if n in _full_tool_catalog]
 
-    user_q = orch_ctx.user_query if orch_ctx is not None else next((m.get("content", "") for m in reversed(base_messages) if m.get("role") == "user"), "")
+    # Pure memory recall (e.g. "what was my git repo url", "what is my name") should NOT force a Step-1 web call!
+    is_pure_memory_recall = bool(
+        _re.search(r"\b(what was my|whats my|what's my|what is my|remember my|my previous|did i (say|give|share))\b", user_q, _re.IGNORECASE)
+        and not _re.search(r"\b(scrap|scrape|crawl|fetch|check|latest|weather|search|linkedin|indeed|code|inside|analyze)\b", user_q, _re.IGNORECASE)
+        and not extract_urls_from_text(user_q)
+    )
+    has_person_research_intent = bool(
+        _re.search(r"\b(linkedin|indeed|profile|profiles|research|find (him|her|this person|about)|who is|background of)\b", user_q, _re.IGNORECASE)
+    )
     explicit_external_need = bool(
-        tool_choice == "required"
-        or IntentRouter.RAG_PATTERNS.search(user_q)
-        or IntentRouter.WEB_PATTERNS.search(user_q)
-        or (orch_ctx is not None and (orch_ctx.route.use_web or orch_ctx.document_report is not None))
+        not is_pure_memory_recall
+        and (
+            tool_choice == "required"
+            or bool(extract_urls_from_text(user_q))
+            or _has_weather_intent(user_q)
+            or has_person_research_intent
+            or IntentRouter.RAG_PATTERNS.search(user_q)
+            or IntentRouter.WEB_PATTERNS.search(user_q)
+            or (orch_ctx is not None and orch_ctx.document_report is not None)
+        )
     )
 
     observations_log: list[str] = []
 
     for step_idx in range(1, steps_limit + 1):
-        # On Step 1, if user explicitly asked about docs/weather/web/URL, force action='call_tool' so small models never procrastinate
+        # On Step 1, only force action='call_tool' when the query itself explicitly needs external tools (never on pure memory recall)
         if step_idx == 1 and explicit_external_need:
             action_enum = ["call_tool"]
             tool_enum = list(internal_tool_names)
@@ -499,15 +571,16 @@ async def _execute_hybrid_react_loop(
                     "You are an autonomous ReAct Tool Planner. Decide the single next step as JSON.\n"
                     "Available Tools:\n" + "\n".join(tool_catalog_lines) + "\n\n"
                     "Rules:\n"
-                    "1. MULTI-HOP DEPENDENCY ORDER: If the user asks to find an unknown fact/city/value in their document FIRST and then use another tool (like get_weather or web_search) on that result, you MUST call `search_document` (or `read_document_pages`) on Step 1 FIRST! NEVER guess a city or value before looking it up.\n"
-                    "2. If you still need information from a document, table, live weather, or web to answer EVERY part of the user's request, set action='call_tool', pick the exact tool_name, and put ONLY the clean search/city/page argument in query_or_arg.\n"
-                    "3. Never repeat a tool call that already succeeded in [Completed Tool Observations So Far].\n"
-                    "4. Once ALL parts of the user's request are answered by [Completed Tool Observations So Far] (or if no tool is needed), set action='final_answer', tool_name='none', query_or_arg='done'."
+                    "1. USE SESSION MEMORY & SESSION DOCS FIRST: If [Session Conversation Memory] ALREADY answers the user's question (e.g. 'what was my URL / name?' or 'what do you remember about my app?'), set action='final_answer' directly — OR if `search_document` is available and the user asks detailed questions about a previously scraped repo/doc in this session (e.g. features, modules, use-cases of their app), call `search_document` FIRST before searching the generic web!\n"
+                    "2. FOLLOW-UP SEARCH QUERY REWRITE: When calling `web_search` for a vague follow-up (like 'has anyone made such app?' or 'competitors to my app'), ALWAYS rewrite `query_or_arg` into a specific standalone descriptive search query using the actual product purpose/tech from [Session Conversation Memory] (e.g. 'offline-first QR verification warehouse audit platform alternatives') — NEVER search vague phrases like 'make such app' or a bare ambiguous name!\n"
+                    "3. NEVER INVENT FAKE URLs: If the user asks to scrape/inspect their GitHub/site/repo without repeating the URL, use the EXACT real URL from [Session Conversation Memory]! NEVER output placeholder URLs like example.com or github.com/USERNAME/REPO.\n"
+                    "4. DEEP GITHUB / PERSON RESEARCH: Use `scrape_website` on a real GitHub profile or repo URL to drill into repos, READMEs, file trees, and code. Use `research_person` when asked to research a person across GitHub, LinkedIn, Indeed, and portfolios.\n"
+                    "5. MULTI-HOP & LOOP GUARD: If a question requires finding a fact in a document first and then calling another tool, call `search_document` on Step 1 first. Never repeat a tool call that already succeeded in [Completed Tool Observations So Far]. Once answered, set action='final_answer', tool_name='none', query_or_arg='done'."
                 ),
             },
             {
                 "role": "user",
-                "content": f"User Request: {user_q}{obs_section}\n\nOutput the next ReAct JSON decision:",
+                "content": f"User Request: {user_q}{memory_section}{obs_section}\n\nOutput the next ReAct JSON decision:",
             },
         ]
 
@@ -542,6 +615,10 @@ async def _execute_hybrid_react_loop(
             break
 
         t_args = _map_compact_react_arg(t_name, raw_arg)
+        if t_name == "scrape_website" and user_q:
+            t_args["focus_query"] = user_q
+        elif t_name == "research_person" and remembered_urls:
+            t_args["hint_urls"] = remembered_urls
         sig_key = f"{t_name}:{json.dumps(t_args, sort_keys=True)}"
         if sig_key in seen_calls:
             logger.info(f"🔁 [Agent Step {step_idx}] Duplicate call {sig_key} prevented; moving to final synthesis")
@@ -745,16 +822,29 @@ async def completion(
     if not raw_messages:
         raw_messages = [{"role": "user", "content": "Hello"}]
 
-    active_tools = (
-        _merge_agentic_and_client_tools(
+    if is_agentic:
+        has_tenant_docs_for_tools = (
+            (getattr(request, "use_rag", None) is not False)
+            and (
+                (orch_ctx is not None and orch_ctx.document_report is not None)
+                or await _orchestrator.memory.has_tenant_documents(tenant_user_id, tenant_session_id)
+            )
+        )
+        has_tenant_imgs_for_tools = (
+            has_image_input
+            or await _orchestrator.memory.has_tenant_images(tenant_user_id, tenant_session_id)
+        )
+        q_for_tools = orch_ctx.user_query if orch_ctx is not None else ""
+        active_tools = _merge_agentic_and_client_tools(
             _orchestrator,
             request.tools,
             allow_web=(getattr(request, "use_web", None) is not False),
-            allow_rag=(getattr(request, "use_rag", None) is not False),
+            allow_rag=has_tenant_docs_for_tools,
+            has_local_images=has_tenant_imgs_for_tools,
+            allow_weather=_has_weather_intent(q_for_tools),
         )
-        if is_agentic
-        else request.tools
-    )
+    else:
+        active_tools = request.tools
     base_messages_for_agent = [dict(m) for m in raw_messages]
     if not is_agentic:
         raw_messages = _inject_tools_into_messages(raw_messages, active_tools, request.tool_choice)
@@ -906,6 +996,9 @@ async def completion(
         exact_usage = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
         tool_calls = None
         finish_reason = meta.get("finish_reason", "stop")
+
+    if content and not tool_calls:
+        content = strip_ungrounded_citations(content, orch_ctx.citations if orch_ctx else None)
 
     if orch_ctx is not None and content:
         await _orchestrator.memory.record_chat_turn(
@@ -1324,24 +1417,14 @@ MAX_IMAGE_UPLOAD_BYTES = 15 * 1024 * 1024  # 15 MB RAM guard
 async def describe_uploaded_image(
     req: Request,
     image: UploadFile = File(..., description="Image file processed strictly in RAM"),
-    prompt: str = Form(default="", description="Optional question, focus hint, or multi-step agent instruction for the image"),
+    prompt: str = Form(default="", description="Optional focus hint for the Vision model"),
     user_id: str | None = Form(default=None),
     session_id: str | None = Form(default=None),
-    agentic_mode: bool = Form(
-        default=False,
-        description="False = Pure Vision OCR/describe only; True = Run Vision OCR/describe AND chain autonomous ReAct agent tools (Web/Weather/RAG) using the loaded LLM",
-    ),
-    max_agent_steps: int = Form(default=3, description="Max ReAct agent hops when agentic_mode=True (1..6)"),
-    model: str | None = Form(default=None, description="Optional loaded LLM name when agentic_mode=True"),
-    temperature: float | None = Form(default=0.2),
-    max_tokens: int | None = Form(default=512),
-    service: LlmService = Depends(get_repo),
     orch: ChatOrchestrator = Depends(get_orchestrator),
 ):
     """
+    Pure Vision (VLM) OCR & description endpoint:
     Upload an image -> decode in RAM with Vision model (local or VISION_API_URL) -> index in ChromaDB isolated by (user_id, session_id).
-    - Default (`agentic_mode=False` and no `tools`): Returns pure `vision_report` (works on Vision-only cluster nodes without needing an LLM loaded).
-    - Agentic / Tool Mode (`agentic_mode=True` or `tools` provided): Feeds `<vision_analysis>` + OCR into the Hybrid ReAct Agent so it can autonomously chain Web Search, Live Weather, Local Docs RAG, or Custom Tools!
     """
     _require_loaded_vision_model(orch)
     uid, sid = _resolve_tenant(req, explicit_user_id=user_id, explicit_session_id=session_id)
@@ -1360,77 +1443,12 @@ async def describe_uploaded_image(
     )
     vision_ms = round((time.perf_counter() - t_vis0) * 1000, 2)
 
-    # Pure Vision mode (backwards-compatible for vision-only cluster nodes & standard /vision/describe callers)
-    if not agentic_mode:
-        return {
-            "status": "ok",
-            "user_id": uid,
-            "session_id": sid,
-            "vision_report": report.model_dump(),
-            "metrics_ms": {"vision_ms": vision_ms},
-        }
-
-    # Agentic Vision workflow (requires loaded text LLM)
-    clean_model = model.strip() if (model and model.strip() not in ("", "string", "null", "None")) else None
-    active_model = await _require_loaded_model(service, clean_model)
-    effective_question = prompt.strip() or f"Analyze this image ({report.summary}) and provide helpful insights."
-
-    vision_block = (
-        "<vision_analysis>\n"
-        f"Scene: {report.scene}\n"
-        f"Objects: {', '.join(report.objects)}\n"
-        f"Subjects & Details: {report.subjects_and_details}\n"
-        f"Colors & Lighting: {report.colors_and_lighting}\n"
-        f"Visible Text (OCR): {report.visible_text}\n"
-        f"Summary: {report.summary}\n"
-        f"Suggested Search Query: {report.search_query}\n"
-        "</vision_analysis>"
-    )
-    orch_ctx = await orch.prepare_context(
-        [{"role": "user", "content": f"{vision_block}\n\nUser Task: {effective_question}"}],
-        force_web=False,
-        force_rag=False,
-        user_id=uid,
-        session_id=sid,
-        model_name=active_model,
-        agentic_mode=True,
-    )
-    orch_ctx.vision_report = report
-    orch_ctx.user_query = f"{effective_question} (Image Summary: {report.summary} | Visible Text: {report.visible_text[:200]})"
-
-    active_vis_tools = _merge_agentic_and_client_tools(orch, None, allow_web=True, allow_rag=True)
-    gen_kwargs = {k: v for k, v in {"temperature": temperature, "max_tokens": max_tokens}.items() if v is not None}
-    t_ag0 = time.perf_counter()
-    loop_res = await _execute_hybrid_react_loop(
-        service=service,
-        orch=orch,
-        orch_ctx=orch_ctx,
-        base_messages=orch_ctx.enriched_messages,
-        active_tools=active_vis_tools,
-        tool_choice=None,
-        gen_kwargs=gen_kwargs,
-        user_id=uid,
-        session_id=sid,
-        max_steps=max_agent_steps,
-        is_agentic=True,
-        client_tools=None,
-    )
-    agent_ms = round((time.perf_counter() - t_ag0) * 1000, 2)
-
     return {
         "status": "ok",
-        "model": active_model,
         "user_id": uid,
         "session_id": sid,
-        "agentic_mode": agentic_mode,
         "vision_report": report.model_dump(),
-        "agent_answer": None if loop_res["tool_calls"] else loop_res["content"],
-        "tool_calls": loop_res["tool_calls"],
-        "finish_reason": loop_res["finish_reason"],
-        "agent_trace": loop_res["agent_trace"],
-        "citations": [c.model_dump() for c in orch_ctx.citations],
-        "usage": loop_res["usage"],
-        "metrics_ms": {**orch_ctx.metrics_ms, "vision_ms": vision_ms, "agent_loop_ms": agent_ms},
+        "metrics_ms": {"vision_ms": vision_ms},
     }
 
 
@@ -1501,11 +1519,21 @@ async def chat_with_uploaded_image(
 
     agent_trace: list[dict[str, Any]] | None = None
     if agentic_mode:
+        has_up_docs = (use_rag is not False) and (
+            orch_ctx.document_report is not None
+            or await orch.memory.has_tenant_documents(uid, sid)
+        )
+        has_up_imgs = (
+            orch_ctx.vision_report is not None
+            or await orch.memory.has_tenant_images(uid, sid)
+        )
         active_upload_tools = _merge_agentic_and_client_tools(
             orch,
             None,
             allow_web=(use_web is not False),
-            allow_rag=(use_rag is not False),
+            allow_rag=has_up_docs,
+            has_local_images=has_up_imgs,
+            allow_weather=_has_weather_intent(prompt),
         )
         t_ag0 = time.perf_counter()
         loop_res = await _execute_hybrid_react_loop(
@@ -1534,6 +1562,9 @@ async def chat_with_uploaded_image(
         content = response if isinstance(response, str) else str(response)
         extracted_calls = None
         finish_reason = "stop"
+
+    if content and not extracted_calls:
+        content = strip_ungrounded_citations(content, orch_ctx.citations)
 
     if content:
         await orch.memory.record_chat_turn(
@@ -1721,11 +1752,18 @@ async def chat_with_uploaded_code(
     code_agent_trace: list[dict[str, Any]] | None = None
     code_tool_calls: list[dict] | None = None
     if agentic_mode:
+        has_code_docs = (use_rag is not False) and (
+            code_file is not None
+            or await orch.memory.has_tenant_documents(uid, sid)
+        )
+        has_code_imgs = is_image_code or await orch.memory.has_tenant_images(uid, sid)
         active_code_tools = _merge_agentic_and_client_tools(
             orch,
             None,
             allow_web=(use_web is not False or agentic_mode),
-            allow_rag=(use_rag is not False),
+            allow_rag=has_code_docs,
+            has_local_images=has_code_imgs,
+            allow_weather=_has_weather_intent(prompt),
         )
         t_ag0 = time.perf_counter()
         loop_res = await _execute_hybrid_react_loop(
@@ -1755,6 +1793,9 @@ async def chat_with_uploaded_code(
         content = ai_msg.content if hasattr(ai_msg, "content") else str(ai_msg)
         meta = getattr(ai_msg, "response_metadata", {}) or {}
         exact_usage = meta.get("usage", {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0})
+
+    if content and not code_tool_calls:
+        content = strip_ungrounded_citations(content, orch_ctx.citations)
 
     await orch.memory.record_chat_turn(
         query=prompt,
